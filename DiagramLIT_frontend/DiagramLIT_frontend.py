@@ -1,27 +1,146 @@
 import reflex as rx
+from pydantic import BaseModel
 import asyncio
+import base64
 from typing import List, Dict, Any
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Конфигурация доступных бэкендов (устройство + модель)
+# ──────────────────────────────────────────────────────────────────────────
+MODEL_BACKENDS: Dict[str, str] = {
+    "gemini": "Gemini 3.1 Pro · облако",
+    "local_vlm": "Локальная VLM · 8 ГБ VRAM · RU",
+    "orangepi": "YOLOv8 + OCR · OrangePi RV2",
+}
+
+
+class BBox(BaseModel):
+    """Bounding box одного распознанного элемента.
+    Координаты — ДОЛИ от размеров изображения (0..1), а не пиксели.
+    Если модель вернула пиксели — поделите на ширину/высоту изображения."""
+
+    label: str
+    x: float
+    y: float
+    w: float
+    h: float
+
+
+def _demo_result(diagram_type: str = "BPMN Process Diagram") -> Dict[str, Any]:
+    """Временная заглушка. Замени реальным выводом модели (см. _infer_*)."""
+    return {
+        "diagram_type": diagram_type,
+        "detected_elements": [
+            "Start Event",
+            "Task: Проверка заказа",
+            "Gateway: Товар в наличии?",
+            "Task: Оплата",
+            "End Event",
+        ],
+        "relationships": [
+            "Start → Проверка заказа",
+            "Проверка заказа → Gateway",
+            "Gateway → Оплата",
+            "Оплата → End",
+        ],
+        "bounding_boxes": [
+            {"label": "Start", "x": 0.04, "y": 0.40, "w": 0.09, "h": 0.16},
+            {"label": "Проверка заказа", "x": 0.22, "y": 0.33, "w": 0.20, "h": 0.30},
+            {"label": "Gateway", "x": 0.50, "y": 0.36, "w": 0.11, "h": 0.24},
+            {"label": "Оплата", "x": 0.68, "y": 0.33, "w": 0.20, "h": 0.30},
+            {"label": "End", "x": 0.91, "y": 0.41, "w": 0.07, "h": 0.14},
+        ],
+        "step_by_step_description": [
+            "Процесс начинается со стартового события — поступает новый заказ.",
+            "Задача «Проверка заказа»: система проверяет корректность данных.",
+            "Шлюз (Gateway): проверяется наличие товара на складе.",
+            "Если товар есть — выполняется задача «Оплата».",
+            "Конечное событие: процесс завершается, заказ переходит в «Оплачен».",
+        ],
+    }
 
 
 class State(rx.State):
     """Состояние приложения DiagramLIT"""
 
-    # Состояние загрузки
     is_uploading: bool = False
     is_processing: bool = False
 
-    # Данные о диаграмме
+    selected_model: str = "gemini"
+    image_data_url: str = ""
+
     uploaded_filename: str = ""
     diagram_type: str = ""
     detected_elements: List[str] = []
     relationships: List[str] = []
     step_by_step_description: List[str] = []
+    bounding_boxes: List[BBox] = []
 
-    # Текущая активная страница
-    current_step: int = 0
+    # ── Вспомогательное ────────────────────────────────────────────────
+    @rx.var
+    def model_label(self) -> str:
+        return MODEL_BACKENDS.get(self.selected_model, self.selected_model)
+
+    @rx.var
+    def steps_text(self) -> str:
+        """Все шаги одним текстом — для отображения и копирования."""
+        return "\n".join(
+            f"{i + 1}. {s}" for i, s in enumerate(self.step_by_step_description)
+        )
+
+    def set_selected_model(self, value: str):
+        self.selected_model = value
+
+    # ── Точки интеграции реальных моделей ───────────────────────────────
+    # Каждая функция принимает байты картинки и возвращает словарь с полями:
+    #   diagram_type, detected_elements, relationships,
+    #   bounding_boxes (список {label, x, y, w, h} в долях 0..1),
+    #   step_by_step_description
+
+    async def _infer_gemini(self, image_bytes: bytes) -> Dict[str, Any]:
+        """Облачный инференс через Gemini 3.1 Pro.
+        Зависимости: pip install google-genai; ключ в GEMINI_API_KEY.
+        В промпте попроси нормализованные координаты боксов."""
+        # import os
+        # from google import genai
+        # client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
+        # response = client.models.generate_content(
+        #     model="gemini-3.1-pro",
+        #     contents=[{
+        #         "role": "user",
+        #         "parts": [
+        #             {"inline_data": {"mime_type": "image/png", "data": image_bytes}},
+        #             {"text": PROMPT_RU},
+        #         ],
+        #     }],
+        # )
+        # return _parse_model_json(response.text)
+        await asyncio.sleep(1.0)
+        return _demo_result()
+
+    async def _infer_local_vlm(self, image_bytes: bytes) -> Dict[str, Any]:
+        """Локальная VLM на GPU с 8 ГБ VRAM.
+        Рекомендация: Qwen2.5-VL-7B-Instruct в 4-bit — хорошо понимает русский
+        и помещается в ~6-7 ГБ. Pixtral-12B в 8 ГБ влезает плохо.
+        ВАЖНО: инференс блокирующий — выноси в asyncio.to_thread."""
+        # result = await asyncio.to_thread(self._run_local_vlm_blocking, image_bytes)
+        # return result
+        await asyncio.sleep(1.5)
+        return _demo_result()
+
+    async def _infer_orangepi(self, image_bytes: bytes) -> Dict[str, Any]:
+        """Пайплайн для OrangePi RV2 (RISC-V, без CUDA):
+          1. YOLOv8 (onnx/ncnn) — детекция блоков (тут боксы);
+          2. OCR (PaddleOCR / Tesseract rus) — текст внутри блоков;
+          3. лёгкая LLM (Qwen2.5-0.5B/1.5B в GGUF) — оборачивает JSON в текст.
+        YOLO даёт пиксели — дели на ширину/высоту для нормализации."""
+        # result = await asyncio.to_thread(self._run_orangepi_blocking, image_bytes)
+        # return result
+        await asyncio.sleep(2.0)
+        return _demo_result()
 
     async def handle_upload(self, files: List[rx.UploadFile]):
-        """Обработка загруженного файла диаграммы"""
         if not files:
             return
 
@@ -32,19 +151,24 @@ class State(rx.State):
         try:
             file_content = await files[0].read()
 
-            # Временная имитация для демонстрации
-            await asyncio.sleep(1.5)
+            self.image_data_url = (
+                "data:image/png;base64," + base64.b64encode(file_content).decode()
+            )
 
-            self.diagram_type = "UML Class Diagram"
-            self.detected_elements = ["User", "Order", "Product", "Payment"]
-            self.relationships = ["User → Order", "Order → Product", "Payment → Order"]
-            self.step_by_step_description = [
-                "Пользователь создаёт новый заказ",
-                "Система проверяет наличие товаров",
-                "Формируется счёт на оплату",
-                "Пользователь подтверждает платеж",
-                "Статус заказа обновляется на 'Оплачен'",
-            ]
+            if self.selected_model == "gemini":
+                result = await self._infer_gemini(file_content)
+            elif self.selected_model == "local_vlm":
+                result = await self._infer_local_vlm(file_content)
+            elif self.selected_model == "orangepi":
+                result = await self._infer_orangepi(file_content)
+            else:
+                result = _demo_result("Неизвестная модель")
+
+            self.diagram_type = result["diagram_type"]
+            self.detected_elements = result["detected_elements"]
+            self.relationships = result["relationships"]
+            self.step_by_step_description = result["step_by_step_description"]
+            self.bounding_boxes = [BBox(**b) for b in result.get("bounding_boxes", [])]
 
         except Exception as e:
             print(f"Ошибка: {e}")
@@ -54,25 +178,17 @@ class State(rx.State):
 
         yield rx.redirect("/results")
 
-    def next_step(self):
-        if self.current_step < len(self.step_by_step_description) - 1:
-            self.current_step += 1
-
-    def prev_step(self):
-        if self.current_step > 0:
-            self.current_step -= 1
-
     def clear_upload(self):
         self.uploaded_filename = ""
+        self.image_data_url = ""
         self.diagram_type = ""
         self.detected_elements = []
         self.relationships = []
         self.step_by_step_description = []
-        self.current_step = 0
+        self.bounding_boxes = []
 
 
 def navbar():
-    """Навигационная панель"""
     return rx.hstack(
         rx.hstack(
             rx.image(src="/favicon.ico", width="32px", height="32px"),
@@ -102,7 +218,6 @@ def navbar():
 
 
 def footer():
-    """Подвал"""
     return rx.center(
         rx.vstack(
             rx.text(
@@ -111,7 +226,7 @@ def footer():
                 color="#a0aec0",
             ),
             rx.text(
-                "Распознавание UML, BPMN, Activity, C4 диаграмм",
+                "Распознавание BPMN-диаграмм",
                 font_size="0.7em",
                 color="#a0aec0",
             ),
@@ -124,34 +239,63 @@ def footer():
     )
 
 
+def model_selector() -> rx.Component:
+    return rx.vstack(
+        rx.hstack(
+            rx.icon("cpu", size=20, color="#667eea"),
+            rx.text(
+                "Устройство и модель",
+                font_size="0.95em",
+                font_weight="600",
+                color="#1a202c",
+            ),
+            spacing="2",
+            align="center",
+        ),
+        rx.select.root(
+            rx.select.trigger(placeholder="Выберите модель", width="100%"),
+            rx.select.content(
+                rx.select.group(
+                    rx.select.item(MODEL_BACKENDS["gemini"], value="gemini"),
+                    rx.select.item(MODEL_BACKENDS["local_vlm"], value="local_vlm"),
+                    rx.select.item(MODEL_BACKENDS["orangepi"], value="orangepi"),
+                ),
+            ),
+            value=State.selected_model,
+            on_change=State.set_selected_model,
+            width="100%",
+        ),
+        spacing="2",
+        align="start",
+        width="100%",
+    )
+
+
 def index() -> rx.Component:
-    """Главная страница с загрузкой диаграммы"""
     return rx.fragment(
         navbar(),
         rx.container(
             rx.vstack(
-                # Hero section - теперь текст белый
                 rx.vstack(
                     rx.heading(
-                        "Анализ бизнес-диаграмм с помощью ИИ",
+                        "Анализ BPMN-диаграмм с помощью ИИ",
                         size="8",
                         text_align="center",
                         font_weight="bold",
-                        color="white",  # Белый цвет
+                        color="white",
                         text_shadow="0 2px 4px rgba(0,0,0,0.2)",
                     ),
                     rx.text(
                         "Загрузите диаграмму — получите пошаговое описание всех элементов",
                         font_size="1.2em",
                         text_align="center",
-                        color="#e2e8f0",  # Светло-серый
+                        color="#e2e8f0",
                     ),
                     spacing="3",
                     align="center",
                     width="100%",
                     padding_bottom="2em",
                 ),
-                # Upload card - белая карточка
                 rx.card(
                     rx.vstack(
                         rx.hstack(
@@ -161,17 +305,18 @@ def index() -> rx.Component:
                             align="center",
                         ),
                         rx.text(
-                            "Поддерживаемые форматы: PNG, JPG, JPEG, SVG",
+                            "Поддерживаемый формат: PNG",
                             font_size="0.8em",
                             color="#718096",
                         ),
                         rx.divider(),
-                        # Upload area
+                        model_selector(),
+                        rx.divider(),
                         rx.upload(
                             rx.vstack(
                                 rx.icon("image", size=40, color="#a0aec0"),
                                 rx.text(
-                                    "Перетащите файл сюда или",
+                                    "Перетащите PNG-файл сюда или",
                                     font_size="0.9em",
                                     color="#4a5568",
                                 ),
@@ -195,26 +340,24 @@ def index() -> rx.Component:
                             ),
                             on_drop=State.handle_upload,
                             multiple=False,
-                            accept={"image/*": [".png", ".jpg", ".jpeg", ".svg"]},
+                            accept={"image/png": [".png"]},
                             border="2px dashed #cbd5e0",
                             border_radius="12px",
                             padding="2.5em",
                             bg="#fafafa",
                         ),
-                        # Loading indicator
                         rx.cond(
                             State.is_uploading,
                             rx.center(
                                 rx.spinner(size="3", color="#667eea"),
                                 rx.text(
-                                    "Обработка диаграммы...",
+                                    f"Обработка через {State.model_label}...",
                                     margin_left="1em",
                                     color="#4a5568",
                                 ),
                                 padding="2em",
                             ),
                         ),
-                        # Clear button
                         rx.cond(
                             State.uploaded_filename,
                             rx.button(
@@ -235,16 +378,15 @@ def index() -> rx.Component:
                     padding="2em",
                     box_shadow="0 10px 15px -3px rgba(0, 0, 0, 0.1)",
                     border_radius="16px",
-                    bg="white",  # Белый фон карточки
+                    bg="white",
                 ),
-                # Features section - карточки с белым фоном
                 rx.grid(
                     rx.card(
                         rx.vstack(
                             rx.icon("brain", size=32, color="#667eea"),
                             rx.heading("ИИ-распознавание", size="4", color="#1a202c"),
                             rx.text(
-                                "Автоматическое определение типов диаграмм и их элементов",
+                                "Автоматическое определение элементов BPMN-диаграммы",
                                 text_align="center",
                                 font_size="0.9em",
                                 color="#4a5568",
@@ -275,10 +417,10 @@ def index() -> rx.Component:
                     ),
                     rx.card(
                         rx.vstack(
-                            rx.icon("layout", size=32, color="#667eea"),
-                            rx.heading("Все форматы", size="4", color="#1a202c"),
+                            rx.icon("git-branch", size=32, color="#667eea"),
+                            rx.heading("Формат BPMN", size="4", color="#1a202c"),
                             rx.text(
-                                "Поддержка UML, BPMN, Activity, C4 диаграмм",
+                                "Распознавание событий, задач, шлюзов и потоков",
                                 text_align="center",
                                 font_size="0.9em",
                                 color="#4a5568",
@@ -307,13 +449,166 @@ def index() -> rx.Component:
     )
 
 
+def bbox_overlay(box: BBox) -> rx.Component:
+    """Одна красная рамка поверх изображения + подпись."""
+    return rx.box(
+        rx.box(
+            rx.text(
+                box.label,
+                font_size="0.7em",
+                font_weight="600",
+                color="white",
+                white_space="nowrap",
+            ),
+            position="absolute",
+            top="-1.45em",
+            left="-2px",
+            bg="#e53e3e",
+            padding_x="0.4em",
+            padding_y="0.05em",
+            border_radius="4px 4px 0 0",
+        ),
+        position="absolute",
+        left=f"{box.x * 100}%",
+        top=f"{box.y * 100}%",
+        width=f"{box.w * 100}%",
+        height=f"{box.h * 100}%",
+        border="2px solid #e53e3e",
+        border_radius="3px",
+        box_sizing="border-box",
+        pointer_events="none",
+    )
+
+
+def diagram_viewer() -> rx.Component:
+    """Окно с изображением и распознанными элементами (красные боксы)."""
+    return rx.card(
+        rx.vstack(
+            rx.hstack(
+                rx.icon("scan-search", size=24, color="#667eea"),
+                rx.heading("Распознанные элементы", size="4"),
+                spacing="2",
+                align="center",
+            ),
+            rx.text(
+                "Красные рамки — обнаруженные элементы диаграммы",
+                font_size="0.85em",
+                color="#718096",
+            ),
+            rx.divider(),
+            rx.box(
+                rx.image(
+                    src=State.image_data_url,
+                    width="100%",
+                    height="auto",
+                    display="block",
+                    border_radius="8px",
+                ),
+                rx.foreach(State.bounding_boxes, bbox_overlay),
+                position="relative",
+                width="100%",
+                max_width="820px",
+                margin="0 auto",
+            ),
+            spacing="3",
+            width="100%",
+            align="stretch",
+        ),
+        width="100%",
+        padding="1.5em",
+        border_radius="12px",
+        bg="white",
+    )
+
+
+def steps_panel() -> rx.Component:
+    """Окно с текстом всех шагов + кнопка копирования."""
+    return rx.card(
+        rx.vstack(
+            rx.hstack(
+                rx.hstack(
+                    rx.icon("list-checks", size=24, color="#667eea"),
+                    rx.heading("Пошаговое описание", size="4"),
+                    spacing="2",
+                    align="center",
+                ),
+                rx.spacer(),
+                rx.button(
+                    rx.hstack(
+                        rx.icon("copy", size=16),
+                        rx.text("Копировать"),
+                        spacing="2",
+                        align="center",
+                    ),
+                    on_click=[
+                        rx.set_clipboard(State.steps_text),
+                        rx.toast.success("Текст скопирован в буфер обмена"),
+                    ],
+                    color_scheme="blue",
+                    variant="soft",
+                    size="2",
+                ),
+                width="100%",
+                align="center",
+            ),
+            rx.divider(),
+            rx.box(
+                rx.vstack(
+                    rx.foreach(
+                        State.step_by_step_description,
+                        lambda step, idx: rx.hstack(
+                            rx.center(
+                                rx.text(
+                                    idx + 1,
+                                    font_size="0.8em",
+                                    font_weight="700",
+                                    color="white",
+                                ),
+                                min_width="1.6em",
+                                height="1.6em",
+                                bg="#667eea",
+                                border_radius="50%",
+                                flex_shrink="0",
+                            ),
+                            rx.text(
+                                step,
+                                font_size="0.95em",
+                                color="#2d3748",
+                                line_height="1.5",
+                            ),
+                            spacing="3",
+                            align="start",
+                            width="100%",
+                        ),
+                    ),
+                    spacing="3",
+                    align="start",
+                    width="100%",
+                ),
+                width="100%",
+                max_height="420px",
+                overflow_y="auto",
+                padding="1.25em",
+                bg="#f7fafc",
+                border="1px solid #e2e8f0",
+                border_radius="10px",
+            ),
+            spacing="3",
+            width="100%",
+            align="stretch",
+        ),
+        width="100%",
+        padding="1.5em",
+        border_radius="12px",
+        bg="white",
+    )
+
+
 def results() -> rx.Component:
-    """Страница с результатами распознавания"""
     return rx.fragment(
         navbar(),
         rx.container(
             rx.vstack(
-                # Header with navigation
                 rx.hstack(
                     rx.link(
                         rx.button(
@@ -332,7 +627,6 @@ def results() -> rx.Component:
                     width="100%",
                 ),
                 rx.divider(),
-                # Diagram type card
                 rx.cond(
                     State.diagram_type,
                     rx.card(
@@ -343,11 +637,20 @@ def results() -> rx.Component:
                                 spacing="2",
                                 align="center",
                             ),
-                            rx.badge(
-                                State.diagram_type,
-                                color_scheme="blue",
-                                variant="soft",
-                                size="3",
+                            rx.hstack(
+                                rx.badge(
+                                    State.diagram_type,
+                                    color_scheme="blue",
+                                    variant="soft",
+                                    size="3",
+                                ),
+                                rx.text(
+                                    f"Модель: {State.model_label}",
+                                    font_size="0.8em",
+                                    color="#718096",
+                                ),
+                                spacing="3",
+                                align="center",
                             ),
                         ),
                         spacing="3",
@@ -357,14 +660,17 @@ def results() -> rx.Component:
                         bg="white",
                     ),
                 ),
-                # Detected elements card
+                rx.cond(
+                    State.image_data_url,
+                    diagram_viewer(),
+                ),
                 rx.cond(
                     State.detected_elements,
                     rx.card(
                         rx.vstack(
                             rx.hstack(
                                 rx.icon("grid", size=24, color="#667eea"),
-                                rx.heading("Обнаруженные элементы", size="4"),
+                                rx.heading("Список элементов", size="4"),
                                 spacing="2",
                                 align="center",
                             ),
@@ -393,7 +699,6 @@ def results() -> rx.Component:
                         bg="white",
                     ),
                 ),
-                # Relationships card
                 rx.cond(
                     State.relationships,
                     rx.card(
@@ -428,83 +733,9 @@ def results() -> rx.Component:
                         bg="white",
                     ),
                 ),
-                # Step by step description card
                 rx.cond(
                     State.step_by_step_description,
-                    rx.card(
-                        rx.vstack(
-                            rx.hstack(
-                                rx.icon("list", size=24, color="#667eea"),
-                                rx.heading("Пошаговое описание", size="4"),
-                                spacing="2",
-                                align="center",
-                            ),
-                            rx.divider(),
-                            # Current step card
-                            rx.card(
-                                rx.vstack(
-                                    rx.text(
-                                        State.step_by_step_description[
-                                            State.current_step
-                                        ],
-                                        font_size="1.1em",
-                                        font_weight="bold",
-                                        color="#2d3748",
-                                    ),
-                                    rx.badge(
-                                        f"Шаг {State.current_step + 1} из {State.step_by_step_description.length()}",
-                                        color_scheme="blue",
-                                        variant="soft",
-                                        size="2",
-                                    ),
-                                ),
-                                spacing="3",
-                                width="100%",
-                                bg="#f7fafc",
-                                border_radius="12px",
-                                padding="1.5em",
-                            ),
-                            # Navigation buttons
-                            rx.hstack(
-                                rx.button(
-                                    rx.hstack(
-                                        rx.icon("arrow-left", size=16),
-                                        rx.text("Предыдущий"),
-                                    ),
-                                    on_click=State.prev_step,
-                                    disabled=State.current_step == 0,
-                                    variant="outline",
-                                    bg="white",
-                                ),
-                                rx.button(
-                                    rx.hstack(
-                                        rx.text("Следующий"),
-                                        rx.icon("arrow-right", size=16),
-                                    ),
-                                    on_click=State.next_step,
-                                    disabled=State.current_step
-                                    >= State.step_by_step_description.length() - 1,
-                                    color_scheme="blue",
-                                ),
-                                justify="center",
-                                spacing="4",
-                                width="100%",
-                            ),
-                            # Progress bar
-                            rx.progress(
-                                value=(State.current_step + 1)
-                                / State.step_by_step_description.length()
-                                * 100,
-                                color_scheme="blue",
-                                width="100%",
-                            ),
-                        ),
-                        spacing="4",
-                        width="100%",
-                        padding="1.5em",
-                        border_radius="12px",
-                        bg="white",
-                    ),
+                    steps_panel(),
                 ),
                 spacing="6",
                 align="stretch",
@@ -518,17 +749,12 @@ def results() -> rx.Component:
     )
 
 
-# Custom styles
 style = {
     "font_family": "system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
     "background": "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
     "background_attachment": "fixed",
 }
 
-# Создаём приложение
-app = rx.App(
-    style=style,
-)
-
+app = rx.App(style=style)
 app.add_page(index, route="/", title="DiagramLIT — Анализ диаграмм")
 app.add_page(results, route="/results", title="Результаты — DiagramLIT")
