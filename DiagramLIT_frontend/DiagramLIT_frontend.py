@@ -221,7 +221,7 @@ def footer():
     return rx.center(
         rx.vstack(
             rx.text(
-                "© 2024 DiagramLIT — AI-powered Diagram Analysis",
+                "© 2026 DiagramLIT — AI-powered Diagram Analysis",
                 font_size="0.8em",
                 color="#a0aec0",
             ),
@@ -608,27 +608,27 @@ def results() -> rx.Component:
     return rx.fragment(
         navbar(),
         rx.container(
-            rx.vstack(
-                rx.hstack(
-                    rx.link(
-                        rx.button(
-                            rx.hstack(
-                                rx.icon("arrow-left", size=16),
-                                rx.text("Назад"),
+            rx.cond(
+                State.diagram_type,
+                rx.vstack(
+                    rx.hstack(
+                        rx.link(
+                            rx.button(
+                                rx.hstack(
+                                    rx.icon("arrow-left", size=16),
+                                    rx.text("Назад"),
+                                ),
+                                variant="outline",
+                                bg="white",
                             ),
-                            variant="outline",
-                            bg="white",
+                            href="/",
                         ),
-                        href="/",
+                        rx.heading("Результаты анализа", size="7", color="white"),
+                        spacing="4",
+                        align="center",
+                        width="100%",
                     ),
-                    rx.heading("Результаты анализа", size="7", color="white"),
-                    spacing="4",
-                    align="center",
-                    width="100%",
-                ),
-                rx.divider(),
-                rx.cond(
-                    State.diagram_type,
+                    rx.divider(),
                     rx.card(
                         rx.vstack(
                             rx.hstack(
@@ -659,86 +659,87 @@ def results() -> rx.Component:
                         border_radius="12px",
                         bg="white",
                     ),
-                ),
-                rx.cond(
-                    State.image_data_url,
-                    diagram_viewer(),
-                ),
-                rx.cond(
-                    State.detected_elements,
-                    rx.card(
-                        rx.vstack(
-                            rx.hstack(
-                                rx.icon("grid", size=24, color="#667eea"),
-                                rx.heading("Список элементов", size="4"),
-                                spacing="2",
-                                align="center",
-                            ),
-                            rx.flex(
-                                rx.foreach(
-                                    State.detected_elements,
-                                    lambda el: rx.badge(
-                                        el,
-                                        color_scheme="green",
-                                        variant="soft",
-                                        size="2",
-                                        padding_x="1em",
-                                        padding_y="0.5em",
-                                        border_radius="8px",
-                                    ),
-                                ),
-                                wrap="wrap",
-                                spacing="2",
-                                gap="2",
-                            ),
-                        ),
-                        spacing="3",
-                        width="100%",
-                        padding="1.5em",
-                        border_radius="12px",
-                        bg="white",
-                    ),
-                ),
-                rx.cond(
-                    State.relationships,
-                    rx.card(
-                        rx.vstack(
-                            rx.hstack(
-                                rx.icon("share-2", size=24, color="#667eea"),
-                                rx.heading("Связи между элементами", size="4"),
-                                spacing="2",
-                                align="center",
-                            ),
+                    rx.cond(State.image_data_url, diagram_viewer()),
+                    rx.cond(
+                        State.detected_elements,
+                        rx.card(
                             rx.vstack(
-                                rx.foreach(
-                                    State.relationships,
-                                    lambda rel: rx.hstack(
-                                        rx.icon("link-2", size=14, color="#764ba2"),
-                                        rx.text(
-                                            rel, font_size="0.95em", color="#2d3748"
-                                        ),
-                                        spacing="2",
-                                        align="center",
-                                    ),
+                                rx.hstack(
+                                    rx.icon("grid", size=24, color="#667eea"),
+                                    rx.heading("Список элементов", size="4"),
+                                    spacing="2",
+                                    align="center",
                                 ),
-                                spacing="2",
-                                align="start",
-                                width="100%",
+                                rx.flex(
+                                    rx.foreach(
+                                        State.detected_elements,
+                                        lambda el: rx.badge(
+                                            el,
+                                            color_scheme="green",
+                                            variant="soft",
+                                            size="2",
+                                            padding_x="1em",
+                                            padding_y="0.5em",
+                                            border_radius="8px",
+                                        ),
+                                    ),
+                                    wrap="wrap",
+                                    spacing="2",
+                                    gap="2",
+                                ),
                             ),
+                            spacing="3",
+                            width="100%",
+                            padding="1.5em",
+                            border_radius="12px",
+                            bg="white",
                         ),
-                        spacing="3",
-                        width="100%",
-                        padding="1.5em",
-                        border_radius="12px",
-                        bg="white",
                     ),
+                    rx.cond(
+                        State.relationships,
+                        rx.card(
+                            rx.vstack(
+                                rx.hstack(
+                                    rx.icon("share-2", size=24, color="#667eea"),
+                                    rx.heading("Связи между элементами", size="4"),
+                                    spacing="2",
+                                    align="center",
+                                ),
+                                rx.vstack(
+                                    rx.foreach(
+                                        State.relationships,
+                                        lambda rel: rx.hstack(
+                                            rx.icon("link-2", size=14, color="#764ba2"),
+                                            rx.text(rel, font_size="0.95em", color="#2d3748"),
+                                            spacing="2",
+                                            align="center",
+                                        ),
+                                    ),
+                                    spacing="2",
+                                    align="start",
+                                    width="100%",
+                                ),
+                            ),
+                            spacing="3",
+                            width="100%",
+                            padding="1.5em",
+                            border_radius="12px",
+                            bg="white",
+                        ),
+                    ),
+                    rx.cond(State.step_by_step_description, steps_panel()),
+                    spacing="6",
+                    align="stretch",
                 ),
-                rx.cond(
-                    State.step_by_step_description,
-                    steps_panel(),
+                rx.center(
+                    rx.hstack(
+                        rx.spinner(size="3", color="#667eea"),
+                        rx.text("Загрузка результатов...", color="white", font_size="1.1em"),
+                        spacing="3",
+                        align="center",
+                    ),
+                    min_height="60vh",
                 ),
-                spacing="6",
-                align="stretch",
             ),
             max_width="1000px",
             padding_x="2em",
@@ -747,7 +748,6 @@ def results() -> rx.Component:
         ),
         footer(),
     )
-
 
 style = {
     "font_family": "system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",

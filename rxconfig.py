@@ -8,6 +8,7 @@ config = rx.Config(
         rx.plugins.SitemapPlugin(),
         rx.plugins.TailwindV4Plugin(),
     ],
-    api_url=os.getenv("BACKEND_URL", "http://localhost:8000"),
+    #api_url=os.getenv("BACKEND_URL", "http://localhost:8080"),
+    api_url = 'https://diagramlit.ru',
 )
 
