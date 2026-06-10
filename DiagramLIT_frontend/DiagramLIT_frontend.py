@@ -183,7 +183,7 @@ class State(rx.State):
     def set_selected_model(self, value: str):
         self.selected_model = value
 
-    def begin_upload(self, files=None):
+    def begin_upload(self):
         """Немедленно показывает анимацию через WebSocket — до начала HTTP-загрузки файла."""
         self.is_uploading = True
         self.error_message = ""
@@ -484,7 +484,10 @@ def loading_content() -> rx.Component:
                 rx.text("Изображение загружено", font_size="0.95em", color="#2d3748"),
                 align="center",
                 width="100%",
-                style={"animation": "dl-fadein 0.5s ease 0.3s forwards", "opacity": "0"},
+                style={
+                    "animation": "dl-fadein 0.5s ease 0.3s forwards",
+                    "opacity": "0",
+                },
             ),
             rx.hstack(
                 rx.spinner(size="1", color="#667eea"),
@@ -492,7 +495,10 @@ def loading_content() -> rx.Component:
                 spacing="3",
                 align="center",
                 width="100%",
-                style={"animation": "dl-fadein 0.5s ease 1.5s forwards", "opacity": "0"},
+                style={
+                    "animation": "dl-fadein 0.5s ease 1.5s forwards",
+                    "opacity": "0",
+                },
             ),
             rx.hstack(
                 rx.spinner(size="1", color="#667eea"),
@@ -504,7 +510,10 @@ def loading_content() -> rx.Component:
                 spacing="3",
                 align="center",
                 width="100%",
-                style={"animation": "dl-fadein 0.5s ease 5.0s forwards", "opacity": "0"},
+                style={
+                    "animation": "dl-fadein 0.5s ease 5.0s forwards",
+                    "opacity": "0",
+                },
             ),
             rx.hstack(
                 rx.spinner(size="1", color="#667eea"),
@@ -516,7 +525,10 @@ def loading_content() -> rx.Component:
                 spacing="3",
                 align="center",
                 width="100%",
-                style={"animation": "dl-fadein 0.5s ease 10.0s forwards", "opacity": "0"},
+                style={
+                    "animation": "dl-fadein 0.5s ease 10.0s forwards",
+                    "opacity": "0",
+                },
             ),
             spacing="3",
             align="start",
@@ -583,7 +595,9 @@ def index() -> rx.Component:
                         rx.vstack(
                             rx.hstack(
                                 rx.icon("upload", size=30, color="#667eea"),
-                                rx.heading("Загрузка диаграммы", size="5", color="#1a202c"),
+                                rx.heading(
+                                    "Загрузка диаграммы", size="5", color="#1a202c"
+                                ),
                                 spacing="3",
                                 align="center",
                             ),
@@ -621,7 +635,12 @@ def index() -> rx.Component:
                                     spacing="3",
                                     align="center",
                                 ),
-                                on_drop=[State.begin_upload, State.handle_upload],
+                                on_drop=[
+                                    State.begin_upload,
+                                    State.handle_upload(
+                                        rx.upload_files(upload_id="diagramlit_upload")
+                                    ),
+                                ],
                                 id="diagramlit_upload",
                                 multiple=False,
                                 accept={"image/png": [".png"]},
@@ -1059,7 +1078,9 @@ def results() -> rx.Component:
                                 rx.card(
                                     rx.vstack(
                                         rx.hstack(
-                                            rx.icon("layout_grid", size=24, color="#667eea"),
+                                            rx.icon(
+                                                "layout_grid", size=24, color="#667eea"
+                                            ),
                                             rx.heading("Список элементов", size="4"),
                                             spacing="2",
                                             align="center",
