@@ -217,6 +217,14 @@ class State(rx.State):
             if delta:
                 text += delta
         print(f"[DiagramLIT] Gemini raw response ({len(text)} chars): {text[:300]!r}")
+        stripped = text.strip()
+        if not stripped.startswith("{"):
+            if "429" in stripped:
+                raise RuntimeError(
+                    "Превышен лимит запросов к Gemini API (429). "
+                    "Подождите 30–60 секунд и попробуйте снова."
+                )
+            raise RuntimeError(f"Неожиданный ответ от API: {stripped[:200]}")
         return _parse_model_json(text)
 
     async def _infer_local_vlm(self, image_bytes: bytes) -> Dict[str, Any]:
@@ -395,6 +403,96 @@ def model_selector() -> rx.Component:
     )
 
 
+def loading_content() -> rx.Component:
+    """Анимированный контент внутри карточки, пока идёт инференс."""
+    return rx.vstack(
+        rx.html(
+            "<style>"
+            "@keyframes dl-spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}"
+            "@keyframes dl-fadein{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}"
+            "</style>"
+        ),
+        rx.box(
+            style={
+                "width": "72px",
+                "height": "72px",
+                "border": "5px solid #e2e8f0",
+                "border-top-color": "#667eea",
+                "border-radius": "50%",
+                "animation": "dl-spin 1s linear infinite",
+                "margin": "0 auto",
+            },
+        ),
+        rx.vstack(
+            rx.heading("Анализируем диаграмму", size="5", color="#1a202c"),
+            rx.text(
+                f"Модель: {State.model_label}",
+                font_size="0.85em",
+                color="#718096",
+            ),
+            spacing="1",
+            align="center",
+        ),
+        rx.divider(),
+        rx.vstack(
+            rx.hstack(
+                rx.text(
+                    "✓",
+                    color="#38a169",
+                    font_weight="700",
+                    font_size="1.1em",
+                    min_width="1.8em",
+                ),
+                rx.text("Изображение загружено", font_size="0.95em", color="#2d3748"),
+                align="center",
+                width="100%",
+                style={"animation": "dl-fadein 0.5s ease 0.3s forwards", "opacity": "0"},
+            ),
+            rx.hstack(
+                rx.spinner(size="1", color="#667eea"),
+                rx.text("Отправляем в модель...", font_size="0.95em", color="#2d3748"),
+                spacing="3",
+                align="center",
+                width="100%",
+                style={"animation": "dl-fadein 0.5s ease 1.5s forwards", "opacity": "0"},
+            ),
+            rx.hstack(
+                rx.spinner(size="1", color="#667eea"),
+                rx.text(
+                    "Распознаём элементы диаграммы...",
+                    font_size="0.95em",
+                    color="#2d3748",
+                ),
+                spacing="3",
+                align="center",
+                width="100%",
+                style={"animation": "dl-fadein 0.5s ease 5.0s forwards", "opacity": "0"},
+            ),
+            rx.hstack(
+                rx.spinner(size="1", color="#667eea"),
+                rx.text(
+                    "Анализируем связи и безопасность...",
+                    font_size="0.95em",
+                    color="#2d3748",
+                ),
+                spacing="3",
+                align="center",
+                width="100%",
+                style={"animation": "dl-fadein 0.5s ease 10.0s forwards", "opacity": "0"},
+            ),
+            spacing="3",
+            align="start",
+            width="100%",
+            padding_x="0.5em",
+        ),
+        spacing="5",
+        align="center",
+        width="100%",
+        min_height="360px",
+        justify="center",
+    )
+
+
 def index() -> rx.Component:
     return rx.box(
         navbar(),
@@ -421,88 +519,81 @@ def index() -> rx.Component:
                     padding_bottom="2em",
                 ),
                 rx.card(
-                    rx.vstack(
-                        rx.hstack(
-                            rx.icon("upload", size=30, color="#667eea"),
-                            rx.heading("Загрузка диаграммы", size="5", color="#1a202c"),
-                            spacing="3",
-                            align="center",
-                        ),
-                        rx.text(
-                            "Поддерживаемый формат: PNG",
-                            font_size="0.8em",
-                            color="#718096",
-                        ),
-                        rx.divider(),
-                        model_selector(),
-                        rx.divider(),
-                        rx.upload(
-                            rx.vstack(
-                                rx.icon("image", size=40, color="#a0aec0"),
-                                rx.text(
-                                    "Перетащите PNG-файл сюда или",
-                                    font_size="0.9em",
-                                    color="#4a5568",
-                                ),
-                                rx.button(
-                                    "Выбрать файл",
-                                    color_scheme="blue",
-                                    size="3",
-                                    variant="solid",
-                                ),
-                                rx.cond(
-                                    State.uploaded_filename,
-                                    rx.badge(
-                                        f"Файл: {State.uploaded_filename}",
-                                        color_scheme="green",
-                                        variant="soft",
-                                        font_size="0.8em",
-                                    ),
-                                ),
+                    rx.cond(
+                        State.is_uploading,
+                        loading_content(),
+                        rx.vstack(
+                            rx.hstack(
+                                rx.icon("upload", size=30, color="#667eea"),
+                                rx.heading("Загрузка диаграммы", size="5", color="#1a202c"),
                                 spacing="3",
                                 align="center",
                             ),
-                            on_drop=State.handle_upload,
-                            multiple=False,
-                            accept={"image/png": [".png"]},
-                            border="2px dashed #cbd5e0",
-                            border_radius="12px",
-                            padding="2.5em",
-                            bg="#fafafa",
-                        ),
-                        rx.cond(
-                            State.is_uploading,
-                            rx.center(
-                                rx.spinner(size="3", color="#667eea"),
-                                rx.text(
-                                    f"Обработка через {State.model_label}...",
-                                    margin_left="1em",
-                                    color="#4a5568",
-                                ),
-                                padding="2em",
+                            rx.text(
+                                "Поддерживаемый формат: PNG",
+                                font_size="0.8em",
+                                color="#718096",
                             ),
-                        ),
-                        rx.cond(
-                            State.uploaded_filename,
-                            rx.button(
-                                rx.hstack(
-                                    rx.icon("trash-2", size=16),
-                                    rx.text("Очистить"),
+                            rx.divider(),
+                            model_selector(),
+                            rx.divider(),
+                            rx.upload(
+                                rx.vstack(
+                                    rx.icon("image", size=40, color="#a0aec0"),
+                                    rx.text(
+                                        "Перетащите PNG-файл сюда или",
+                                        font_size="0.9em",
+                                        color="#4a5568",
+                                    ),
+                                    rx.button(
+                                        "Выбрать файл",
+                                        color_scheme="blue",
+                                        size="3",
+                                        variant="solid",
+                                    ),
+                                    rx.cond(
+                                        State.uploaded_filename,
+                                        rx.badge(
+                                            f"Файл: {State.uploaded_filename}",
+                                            color_scheme="green",
+                                            variant="soft",
+                                            font_size="0.8em",
+                                        ),
+                                    ),
+                                    spacing="3",
+                                    align="center",
                                 ),
-                                on_click=State.clear_upload,
-                                color_scheme="red",
-                                variant="outline",
-                                size="2",
+                                on_drop=State.handle_upload,
+                                multiple=False,
+                                accept={"image/png": [".png"]},
+                                border="2px dashed #cbd5e0",
+                                border_radius="12px",
+                                padding="2.5em",
+                                bg="#fafafa",
                             ),
+                            rx.cond(
+                                State.uploaded_filename,
+                                rx.button(
+                                    rx.hstack(
+                                        rx.icon("trash-2", size=16),
+                                        rx.text("Очистить"),
+                                    ),
+                                    on_click=State.clear_upload,
+                                    color_scheme="red",
+                                    variant="outline",
+                                    size="2",
+                                ),
+                            ),
+                            spacing="5",
+                            align="stretch",
+                            width="100%",
                         ),
                     ),
-                    spacing="5",
-                    align="stretch",
-                    width="100%",
                     padding="2em",
                     box_shadow="0 10px 15px -3px rgba(0, 0, 0, 0.1)",
                     border_radius="16px",
                     bg="white",
+                    min_height="380px",
                 ),
                 rx.grid(
                     rx.card(
