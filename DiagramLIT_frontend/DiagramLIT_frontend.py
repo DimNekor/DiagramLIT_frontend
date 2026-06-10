@@ -586,12 +586,9 @@ def index() -> rx.Component:
                                     spacing="3",
                                     align="center",
                                 ),
-                                on_drop=[
-                                    State.begin_upload,
-                                    State.handle_upload(
-                                        rx.upload_files(upload_id="diagramlit_upload")
-                                    ),
-                                ],
+                                on_drop=State.handle_upload(
+                                    rx.upload_files(upload_id="diagramlit_upload")
+                                ),
                                 id="diagramlit_upload",
                                 multiple=False,
                                 accept={"image/png": [".png"]},
