@@ -69,7 +69,6 @@ BPMN_ANALYSIS_PROMPT = """Ты — эксперт по анализу BPMN-ди�
 def _parse_model_json(text: str) -> Dict[str, Any]:
     """Извлекает JSON из ответа модели, устойчив к markdown-обёрткам."""
     text = text.strip()
-    # убираем ```json ... ``` или ``` ... ```
     text = re.sub(r"^```(?:json)?\s*", "", text)
     text = re.sub(r"\s*```$", "", text.strip())
     text = text.strip()
@@ -94,8 +93,7 @@ MODEL_BACKENDS: Dict[str, str] = {
 
 class BBox(BaseModel):
     """Bounding box одного распознанного элемента.
-    Координаты — ДОЛИ от размеров изображения (0..1), а не пиксели.
-    Если модель вернула пиксели — поделите на ширину/высоту изображения."""
+    Координаты — ДОЛИ от размеров изображения (0..1), а не пиксели."""
 
     label: str
     x: float
@@ -105,51 +103,81 @@ class BBox(BaseModel):
 
 
 def _demo_result(diagram_type: str = "BPMN Process Diagram") -> Dict[str, Any]:
-    """Временная заглушка. Замени реальным выводом модели (см. _infer_*)."""
+    """Временная заглушка для неизвестных моделей."""
     return {
         "diagram_type": diagram_type,
-        "detected_elements": [
-            "Start Event",
-            "Task: Проверка заказа",
-            "Gateway: Товар в наличии?",
-            "Task: Оплата",
-            "End Event",
-        ],
-        "relationships": [
-            "Start → Проверка заказа",
-            "Проверка заказа → Gateway",
-            "Gateway → Оплата",
-            "Оплата → End",
-        ],
-        "bounding_boxes": [
-            {"label": "Start", "x": 0.04, "y": 0.40, "w": 0.09, "h": 0.16},
-            {"label": "Проверка заказа", "x": 0.22, "y": 0.33, "w": 0.20, "h": 0.30},
-            {"label": "Gateway", "x": 0.50, "y": 0.36, "w": 0.11, "h": 0.24},
-            {"label": "Оплата", "x": 0.68, "y": 0.33, "w": 0.20, "h": 0.30},
-            {"label": "End", "x": 0.91, "y": 0.41, "w": 0.07, "h": 0.14},
-        ],
-        "step_by_step_description": [
-            "Процесс начинается со стартового события — поступает новый заказ.",
-            "Задача «Проверка заказа»: система проверяет корректность данных.",
-            "Шлюз (Gateway): проверяется наличие товара на складе.",
-            "Если товар есть — выполняется задача «Оплата».",
-            "Конечное событие: процесс завершается, заказ переходит в «Оплачен».",
-        ],
-        "security_issues": [
-            "Отсутствует проверка прав доступа перед задачей «Оплата» — любой участник может инициировать платёж.",
-            "Данные заказа передаются между задачами без явного указания шифрования канала.",
-            "Шлюз «Товар в наличии?» не предусматривает ветку обработки ошибок — процесс может зависнуть.",
-            "Задача «Проверка заказа» не имеет таймаута, что открывает вектор для DoS-атаки.",
-            "Отсутствует событие аудита после «Оплата» — невозможно восстановить историю транзакций.",
-        ],
+        "detected_elements": ["Start Event", "Task: Проверка заказа", "End Event"],
+        "relationships": ["Start → Проверка заказа", "Проверка заказа → End"],
+        "bounding_boxes": [],
+        "step_by_step_description": ["Демо-режим: модель не подключена."],
+        "security_issues": [],
     }
+
+
+# ──────────────────────────────────────────────────────────────────────────
+#  Функции инференса (вне State — им не нужен доступ к состоянию)
+# ──────────────────────────────────────────────────────────────────────────
+async def _infer_gemini(image_bytes: bytes) -> Dict[str, Any]:
+    """Инференс через Gemini via OpenAI-compatible Cloudflare Worker.
+    Воркер возвращает SSE-стрим независимо от запроса, поэтому stream=True."""
+    client = AsyncOpenAI(base_url=GEMINI_BASE_URL, api_key=GEMINI_API_KEY)
+    image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+    stream = await client.chat.completions.create(
+        model=GEMINI_MODEL,
+        messages=[
+            {
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": BPMN_ANALYSIS_PROMPT},
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                    },
+                ],
+            }
+        ],
+        stream=True,
+    )
+    text = ""
+    async for chunk in stream:
+        delta = chunk.choices[0].delta.content
+        if delta:
+            text += delta
+    print(f"[DiagramLIT] Gemini raw response ({len(text)} chars): {text[:300]!r}")
+    stripped = text.strip()
+    if not stripped.startswith("{"):
+        if "429" in stripped:
+            raise RuntimeError(
+                "Превышен лимит запросов к Gemini API (429). "
+                "Подождите 30–60 секунд и попробуйте снова."
+            )
+        raise RuntimeError(f"Неожиданный ответ от API: {stripped[:200]}")
+    return _parse_model_json(text)
+
+
+async def _infer_local_vlm(image_bytes: bytes) -> Dict[str, Any]:
+    raise NotImplementedError(
+        f"Локальная VLM ещё не подключена. Запустите FastAPI-бэкенд на {LOCAL_VLM_URL}."
+    )
+
+
+async def _infer_orangepi(image_bytes: bytes) -> Dict[str, Any]:
+    raise NotImplementedError(
+        f"OrangePi-бэкенд ещё не подключён. Запустите FastAPI-бэкенд на {ORANGEPI_URL}."
+    )
+
+
+INFER_FUNCS = {
+    "gemini": _infer_gemini,
+    "local_vlm": _infer_local_vlm,
+    "orangepi": _infer_orangepi,
+}
 
 
 class State(rx.State):
     """Состояние приложения DiagramLIT"""
 
     is_uploading: bool = False
-    is_processing: bool = False
     retry_message: str = ""
 
     selected_model: str = "gemini"
@@ -164,18 +192,20 @@ class State(rx.State):
     security_issues: List[str] = []
     error_message: str = ""
 
+    # Байты картинки между upload-обработчиком и фоновой задачей.
+    # Не отправляется на клиент (приватное поле с подчёркиванием).
+    _pending_image: bytes = b""
+
     @rx.var
     def has_error(self) -> bool:
         return self.diagram_type == "Ошибка" and bool(self.error_message)
 
-    # ── Вспомогательное ────────────────────────────────────────────────
     @rx.var
     def model_label(self) -> str:
         return MODEL_BACKENDS.get(self.selected_model, self.selected_model)
 
     @rx.var
     def steps_text(self) -> str:
-        """Все шаги одним текстом — для отображения и копирования."""
         return "\n".join(
             f"{i + 1}. {s}" for i, s in enumerate(self.step_by_step_description)
         )
@@ -183,178 +213,120 @@ class State(rx.State):
     def set_selected_model(self, value: str):
         self.selected_model = value
 
-    def begin_upload(self):
-        """Немедленно показывает анимацию через WebSocket — до начала HTTP-загрузки файла."""
-        self.is_uploading = True
+    def _reset_results(self):
+        self.diagram_type = ""
+        self.detected_elements = []
+        self.relationships = []
+        self.step_by_step_description = []
+        self.bounding_boxes = []
+        self.security_issues = []
         self.error_message = ""
         self.retry_message = ""
-        self.diagram_type = ""
-        self.detected_elements = []
-        self.relationships = []
-        self.step_by_step_description = []
-        self.bounding_boxes = []
-        self.security_issues = []
         self.image_data_url = ""
 
-    # ── Точки интеграции реальных моделей ───────────────────────────────
-    # Каждая функция принимает байты картинки и возвращает словарь с полями:
-    #   diagram_type, detected_elements, relationships,
-    #   bounding_boxes (список {label, x, y, w, h} в долях 0..1),
-    #   step_by_step_description
-
-    async def _infer_gemini(self, image_bytes: bytes) -> Dict[str, Any]:
-        """Инференс через Gemini 3.1 Pro via OpenAI-compatible Cloudflare Worker.
-
-        Воркер возвращает SSE-стрим независимо от запроса, поэтому используем stream=True.
-        """
-        client = AsyncOpenAI(base_url=GEMINI_BASE_URL, api_key=GEMINI_API_KEY)
-        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-        stream = await client.chat.completions.create(
-            model=GEMINI_MODEL,
-            messages=[
-                {
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": BPMN_ANALYSIS_PROMPT},
-                        {
-                            "type": "image_url",
-                            "image_url": {"url": f"data:image/png;base64,{image_b64}"},
-                        },
-                    ],
-                }
-            ],
-            stream=True,
-        )
-        text = ""
-        async for chunk in stream:
-            delta = chunk.choices[0].delta.content
-            if delta:
-                text += delta
-        print(f"[DiagramLIT] Gemini raw response ({len(text)} chars): {text[:300]!r}")
-        stripped = text.strip()
-        if not stripped.startswith("{"):
-            if "429" in stripped:
-                raise RuntimeError(
-                    "Превышен лимит запросов к Gemini API (429). "
-                    "Подождите 30–60 секунд и попробуйте снова."
-                )
-            raise RuntimeError(f"Неожиданный ответ от API: {stripped[:200]}")
-        return _parse_model_json(text)
-
-    async def _infer_local_vlm(self, image_bytes: bytes) -> Dict[str, Any]:
-        """Локальная VLM — не реализована, требует FastAPI-бэкенд на порту 2023."""
-        raise NotImplementedError(
-            f"Локальная VLM ещё не подключена. Запустите FastAPI-бэкенд на {LOCAL_VLM_URL}."
-        )
-
-    async def _infer_orangepi(self, image_bytes: bytes) -> Dict[str, Any]:
-        """OrangePi RV2 — не реализована, требует FastAPI-бэкенд на порту 2022."""
-        raise NotImplementedError(
-            f"OrangePi-бэкенд ещё не подключён. Запустите FastAPI-бэкенд на {ORANGEPI_URL}."
-        )
+    def begin_upload(self):
+        """Мгновенно показывает анимацию по WebSocket — до HTTP-загрузки файла."""
+        self.is_uploading = True
+        self._reset_results()
 
     async def handle_upload(self, files: List[rx.UploadFile]):
+        """Принимает файл и СРАЗУ завершает HTTP-запрос.
+        Долгий инференс уходит в фоновую задачу run_inference."""
         print(
-            f"[DiagramLIT] handle_upload called: {len(files)} file(s), model={self.selected_model!r}"
+            f"[DiagramLIT] handle_upload: {len(files)} file(s), model={self.selected_model!r}"
         )
         if not files:
+            self.is_uploading = False
             return
 
-        # Сбрасываем результаты предыдущего запроса
-        self.diagram_type = ""
-        self.detected_elements = []
-        self.relationships = []
-        self.step_by_step_description = []
-        self.bounding_boxes = []
-        self.security_issues = []
-        self.error_message = ""
-        self.image_data_url = ""
-
-        self.is_uploading = True
+        self.is_uploading = True  # на случай если begin_upload не сработал
         self.uploaded_filename = files[0].filename
-        yield
 
-        try:
-            file_content = await files[0].read()
-            self.image_data_url = (
-                "data:image/png;base64," + base64.b64encode(file_content).decode()
-            )
+        file_content = await files[0].read()
+        self._pending_image = file_content
+        self.image_data_url = (
+            "data:image/png;base64," + base64.b64encode(file_content).decode()
+        )
 
-            result = None
-            last_error: Exception | None = None
-            max_attempts = 3
-            for attempt in range(max_attempts):
-                try:
-                    if self.selected_model == "gemini":
-                        result = await self._infer_gemini(file_content)
-                    elif self.selected_model == "local_vlm":
-                        result = await self._infer_local_vlm(file_content)
-                    elif self.selected_model == "orangepi":
-                        result = await self._infer_orangepi(file_content)
-                    else:
-                        result = _demo_result("Неизвестная модель")
-                    break
-                except Exception as e:
-                    last_error = e
-                    if "429" in str(e) and attempt < max_attempts - 1:
-                        wait = 35
+        # HTTP-запрос загрузки завершается здесь; дальше — фон по WebSocket
+        return State.run_inference
+
+    @rx.event(background=True)
+    async def run_inference(self):
+        """Фоновая задача: инференс + retry. Все изменения состояния — в async with self."""
+        async with self:
+            image_bytes = self._pending_image
+            model = self.selected_model
+
+        infer = INFER_FUNCS.get(model)
+
+        result: Dict[str, Any] | None = None
+        error: Exception | None = None
+        max_attempts = 3
+
+        for attempt in range(max_attempts):
+            try:
+                if infer is None:
+                    result = _demo_result("Неизвестная модель")
+                else:
+                    result = await infer(image_bytes)
+                break
+            except Exception as e:
+                error = e
+                if "429" in str(e) and attempt < max_attempts - 1:
+                    wait = 35
+                    async with self:
                         self.retry_message = (
                             f"Лимит запросов API. "
                             f"Повтор {attempt + 1}/{max_attempts - 1} через {wait} сек..."
                         )
-                        yield
-                        await asyncio.sleep(wait)
+                    await asyncio.sleep(wait)
+                    async with self:
                         self.retry_message = ""
-                    else:
-                        raise
+                else:
+                    break
 
-            if result is None:
-                raise last_error  # type: ignore[misc]
+        async with self:
+            if result is not None:
+                self.diagram_type = result.get("diagram_type", "Неизвестный тип")
+                self.detected_elements = result.get("detected_elements", [])
+                self.relationships = result.get("relationships", [])
+                self.step_by_step_description = result.get(
+                    "step_by_step_description", []
+                )
+                self.security_issues = result.get("security_issues", [])
 
-            self.diagram_type = result.get("diagram_type", "Неизвестный тип")
-            self.detected_elements = result.get("detected_elements", [])
-            self.relationships = result.get("relationships", [])
-            self.step_by_step_description = result.get("step_by_step_description", [])
-            self.security_issues = result.get("security_issues", [])
-
-            boxes: List[BBox] = []
-            for b in result.get("bounding_boxes", []):
-                try:
-                    boxes.append(
-                        BBox(
-                            label=str(b.get("label", "")),
-                            x=float(b.get("x", 0)),
-                            y=float(b.get("y", 0)),
-                            w=float(b.get("w", 0)),
-                            h=float(b.get("h", 0)),
+                boxes: List[BBox] = []
+                for b in result.get("bounding_boxes", []):
+                    try:
+                        boxes.append(
+                            BBox(
+                                label=str(b.get("label", "")),
+                                x=float(b.get("x", 0)),
+                                y=float(b.get("y", 0)),
+                                w=float(b.get("w", 0)),
+                                h=float(b.get("h", 0)),
+                            )
                         )
-                    )
-                except Exception:
-                    pass
-            self.bounding_boxes = boxes
+                    except Exception:
+                        pass
+                self.bounding_boxes = boxes
+            else:
+                self.error_message = str(error) if error else "Неизвестная ошибка"
+                self.diagram_type = "Ошибка"
+                print(f"[DiagramLIT] Ошибка инференса: {error}")
+                traceback.print_exc()
 
-        except Exception as e:
-            self.error_message = str(e)
-            self.diagram_type = "Ошибка"
-            print(f"[DiagramLIT] Ошибка инференса: {e}")
-            traceback.print_exc()
-        finally:
             self.is_uploading = False
             self.retry_message = ""
+            self._pending_image = b""
 
         yield rx.redirect("/results")
 
     def clear_upload(self):
         self.uploaded_filename = ""
-        self.image_data_url = ""
-        self.diagram_type = ""
-        self.detected_elements = []
-        self.relationships = []
-        self.step_by_step_description = []
-        self.bounding_boxes = []
-        self.security_issues = []
-        self.error_message = ""
-        self.retry_message = ""
+        self._pending_image = b""
+        self._reset_results()
 
 
 def navbar():
@@ -1079,7 +1051,7 @@ def results() -> rx.Component:
                                     rx.vstack(
                                         rx.hstack(
                                             rx.icon(
-                                                "layout_grid", size=24, color="#667eea"
+                                                "layout-grid", size=24, color="#667eea"
                                             ),
                                             rx.heading("Список элементов", size="4"),
                                             spacing="2",
@@ -1205,7 +1177,7 @@ style = {
     "background": "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
     "background_attachment": "fixed",
 }
-print("start")
+
 app = rx.App(style=style)
 app.add_page(index, route="/", title="DiagramLIT — Анализ диаграмм")
 app.add_page(results, route="/results", title="Результаты — DiagramLIT")
