@@ -192,10 +192,6 @@ class State(rx.State):
     security_issues: List[str] = []
     error_message: str = ""
 
-    # Байты картинки между upload-обработчиком и фоновой задачей.
-    # Не отправляется на клиент (приватное поле с подчёркиванием).
-    _pending_image: bytes = b""
-
     @rx.var
     def has_error(self) -> bool:
         return self.diagram_type == "Ошибка" and bool(self.error_message)
@@ -224,14 +220,11 @@ class State(rx.State):
         self.retry_message = ""
         self.image_data_url = ""
 
-    def begin_upload(self):
-        """Мгновенно показывает анимацию по WebSocket — до HTTP-загрузки файла."""
+    def begin_upload(self, files=None):
         self.is_uploading = True
         self._reset_results()
 
     async def handle_upload(self, files: List[rx.UploadFile]):
-        """Принимает файл и СРАЗУ завершает HTTP-запрос.
-        Долгий инференс уходит в фоновую задачу run_inference."""
         print(
             f"[DiagramLIT] handle_upload: {len(files)} file(s), model={self.selected_model!r}"
         )
@@ -239,93 +232,79 @@ class State(rx.State):
             self.is_uploading = False
             return
 
-        self.is_uploading = True  # на случай если begin_upload не сработал
+        self.is_uploading = True
         self.uploaded_filename = files[0].filename
+        yield  # отправляем анимацию немедленно
 
-        file_content = await files[0].read()
-        self._pending_image = file_content
-        self.image_data_url = (
-            "data:image/png;base64," + base64.b64encode(file_content).decode()
-        )
+        try:
+            file_content = await files[0].read()
+            self.image_data_url = (
+                "data:image/png;base64," + base64.b64encode(file_content).decode()
+            )
 
-        # HTTP-запрос загрузки завершается здесь; дальше — фон по WebSocket
-        return State.run_inference
+            result: Dict[str, Any] | None = None
+            last_error: Exception | None = None
 
-    @rx.event(background=True)
-    async def run_inference(self):
-        """Фоновая задача: инференс + retry. Все изменения состояния — в async with self."""
-        async with self:
-            image_bytes = self._pending_image
-            model = self.selected_model
-
-        infer = INFER_FUNCS.get(model)
-
-        result: Dict[str, Any] | None = None
-        error: Exception | None = None
-        max_attempts = 3
-
-        for attempt in range(max_attempts):
-            try:
-                if infer is None:
-                    result = _demo_result("Неизвестная модель")
-                else:
-                    result = await infer(image_bytes)
-                break
-            except Exception as e:
-                error = e
-                if "429" in str(e) and attempt < max_attempts - 1:
-                    wait = 35
-                    async with self:
+            for attempt in range(3):
+                try:
+                    infer = INFER_FUNCS.get(self.selected_model)
+                    if infer is None:
+                        result = _demo_result("Неизвестная модель")
+                    else:
+                        result = await infer(file_content)
+                    break
+                except Exception as e:
+                    last_error = e
+                    if "429" in str(e) and attempt < 2:
+                        wait = 35
                         self.retry_message = (
                             f"Лимит запросов API. "
-                            f"Повтор {attempt + 1}/{max_attempts - 1} через {wait} сек..."
+                            f"Повтор {attempt + 1}/2 через {wait} сек..."
                         )
-                    await asyncio.sleep(wait)
-                    async with self:
+                        yield
+                        await asyncio.sleep(wait)
                         self.retry_message = ""
-                else:
-                    break
+                    else:
+                        raise
 
-        async with self:
-            if result is not None:
-                self.diagram_type = result.get("diagram_type", "Неизвестный тип")
-                self.detected_elements = result.get("detected_elements", [])
-                self.relationships = result.get("relationships", [])
-                self.step_by_step_description = result.get(
-                    "step_by_step_description", []
-                )
-                self.security_issues = result.get("security_issues", [])
+            if result is None:
+                raise last_error or Exception("Неизвестная ошибка")
 
-                boxes: List[BBox] = []
-                for b in result.get("bounding_boxes", []):
-                    try:
-                        boxes.append(
-                            BBox(
-                                label=str(b.get("label", "")),
-                                x=float(b.get("x", 0)),
-                                y=float(b.get("y", 0)),
-                                w=float(b.get("w", 0)),
-                                h=float(b.get("h", 0)),
-                            )
+            self.diagram_type = result.get("diagram_type", "Неизвестный тип")
+            self.detected_elements = result.get("detected_elements", [])
+            self.relationships = result.get("relationships", [])
+            self.step_by_step_description = result.get("step_by_step_description", [])
+            self.security_issues = result.get("security_issues", [])
+
+            boxes: List[BBox] = []
+            for b in result.get("bounding_boxes", []):
+                try:
+                    boxes.append(
+                        BBox(
+                            label=str(b.get("label", "")),
+                            x=float(b.get("x", 0)),
+                            y=float(b.get("y", 0)),
+                            w=float(b.get("w", 0)),
+                            h=float(b.get("h", 0)),
                         )
-                    except Exception:
-                        pass
-                self.bounding_boxes = boxes
-            else:
-                self.error_message = str(error) if error else "Неизвестная ошибка"
-                self.diagram_type = "Ошибка"
-                print(f"[DiagramLIT] Ошибка инференса: {error}")
-                traceback.print_exc()
+                    )
+                except Exception:
+                    pass
+            self.bounding_boxes = boxes
 
+        except Exception as e:
+            self.error_message = str(e)
+            self.diagram_type = "Ошибка"
+            print(f"[DiagramLIT] Ошибка: {e}")
+            traceback.print_exc()
+        finally:
             self.is_uploading = False
             self.retry_message = ""
-            self._pending_image = b""
 
         yield rx.redirect("/results")
 
     def clear_upload(self):
         self.uploaded_filename = ""
-        self._pending_image = b""
         self._reset_results()
 
 
