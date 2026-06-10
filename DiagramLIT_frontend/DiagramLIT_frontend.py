@@ -150,6 +150,7 @@ class State(rx.State):
 
     is_uploading: bool = False
     is_processing: bool = False
+    retry_message: str = ""
 
     selected_model: str = "gemini"
     image_data_url: str = ""
@@ -181,6 +182,19 @@ class State(rx.State):
 
     def set_selected_model(self, value: str):
         self.selected_model = value
+
+    def begin_upload(self, files=None):
+        """Немедленно показывает анимацию через WebSocket — до начала HTTP-загрузки файла."""
+        self.is_uploading = True
+        self.error_message = ""
+        self.retry_message = ""
+        self.diagram_type = ""
+        self.detected_elements = []
+        self.relationships = []
+        self.step_by_step_description = []
+        self.bounding_boxes = []
+        self.security_issues = []
+        self.image_data_url = ""
 
     # ── Точки интеграции реальных моделей ───────────────────────────────
     # Каждая функция принимает байты картинки и возвращает словарь с полями:
@@ -266,14 +280,36 @@ class State(rx.State):
                 "data:image/png;base64," + base64.b64encode(file_content).decode()
             )
 
-            if self.selected_model == "gemini":
-                result = await self._infer_gemini(file_content)
-            elif self.selected_model == "local_vlm":
-                result = await self._infer_local_vlm(file_content)
-            elif self.selected_model == "orangepi":
-                result = await self._infer_orangepi(file_content)
-            else:
-                result = _demo_result("Неизвестная модель")
+            result = None
+            last_error: Exception | None = None
+            max_attempts = 3
+            for attempt in range(max_attempts):
+                try:
+                    if self.selected_model == "gemini":
+                        result = await self._infer_gemini(file_content)
+                    elif self.selected_model == "local_vlm":
+                        result = await self._infer_local_vlm(file_content)
+                    elif self.selected_model == "orangepi":
+                        result = await self._infer_orangepi(file_content)
+                    else:
+                        result = _demo_result("Неизвестная модель")
+                    break
+                except Exception as e:
+                    last_error = e
+                    if "429" in str(e) and attempt < max_attempts - 1:
+                        wait = 35
+                        self.retry_message = (
+                            f"Лимит запросов API. "
+                            f"Повтор {attempt + 1}/{max_attempts - 1} через {wait} сек..."
+                        )
+                        yield
+                        await asyncio.sleep(wait)
+                        self.retry_message = ""
+                    else:
+                        raise
+
+            if result is None:
+                raise last_error  # type: ignore[misc]
 
             self.diagram_type = result.get("diagram_type", "Неизвестный тип")
             self.detected_elements = result.get("detected_elements", [])
@@ -304,6 +340,7 @@ class State(rx.State):
             traceback.print_exc()
         finally:
             self.is_uploading = False
+            self.retry_message = ""
 
         yield rx.redirect("/results")
 
@@ -317,6 +354,7 @@ class State(rx.State):
         self.bounding_boxes = []
         self.security_issues = []
         self.error_message = ""
+        self.retry_message = ""
 
 
 def navbar():
@@ -485,6 +523,26 @@ def loading_content() -> rx.Component:
             width="100%",
             padding_x="0.5em",
         ),
+        rx.cond(
+            State.retry_message,
+            rx.hstack(
+                rx.spinner(size="1", color="#e07b00"),
+                rx.text(
+                    State.retry_message,
+                    font_size="0.85em",
+                    color="#e07b00",
+                    font_weight="500",
+                ),
+                spacing="2",
+                align="center",
+                bg="#fffbeb",
+                border="1px solid #fcd34d",
+                border_radius="8px",
+                padding_x="1em",
+                padding_y="0.6em",
+                width="100%",
+            ),
+        ),
         spacing="5",
         align="center",
         width="100%",
@@ -563,7 +621,8 @@ def index() -> rx.Component:
                                     spacing="3",
                                     align="center",
                                 ),
-                                on_drop=State.handle_upload,
+                                on_drop=[State.begin_upload, State.handle_upload],
+                                id="diagramlit_upload",
                                 multiple=False,
                                 accept={"image/png": [".png"]},
                                 border="2px dashed #cbd5e0",
@@ -1000,7 +1059,7 @@ def results() -> rx.Component:
                                 rx.card(
                                     rx.vstack(
                                         rx.hstack(
-                                            rx.icon("grid", size=24, color="#667eea"),
+                                            rx.icon("layout_grid", size=24, color="#667eea"),
                                             rx.heading("Список элементов", size="4"),
                                             spacing="2",
                                             align="center",
