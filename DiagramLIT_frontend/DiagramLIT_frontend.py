@@ -2,7 +2,84 @@ import reflex as rx
 from pydantic import BaseModel
 import asyncio
 import base64
+import json
+import os
+import re
+import traceback
 from typing import List, Dict, Any
+
+from dotenv import load_dotenv
+from openai import AsyncOpenAI
+
+load_dotenv()
+
+GEMINI_BASE_URL = os.getenv("GEMINI_BASE_URL", "")
+GEMINI_API_KEY = os.getenv("GEMINI_API_KEY", "")
+GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
+
+LOCAL_VLM_URL = os.getenv("LOCAL_VLM_URL", "http://localhost:2023")
+ORANGEPI_URL = os.getenv("ORANGEPI_URL", "http://localhost:2022")
+
+BPMN_ANALYSIS_PROMPT = """Ты — эксперт по анализу BPMN-диаграмм и информационной безопасности.
+
+Проанализируй предоставленное изображение BPMN-диаграммы и верни ответ СТРОГО в виде JSON-объекта без markdown, без пояснений, только JSON.
+
+Структура ответа:
+{
+  "diagram_type": "<тип диаграммы: BPMN Process Diagram / Collaboration / Choreography / другое>",
+  "detected_elements": [
+    "<тип и метка каждого элемента, например: 'Start Event', 'Task: Оплата', 'Gateway: Условие'>",
+    "..."
+  ],
+  "relationships": [
+    "<связь в формате 'Источник → Цель', например: 'Start Event → Task: Оплата'>",
+    "..."
+  ],
+  "bounding_boxes": [
+    {
+      "label": "<метка элемента>",
+      "x": 0.0,
+      "y": 0.0,
+      "w": 0.1,
+      "h": 0.1
+    }
+  ],
+  "step_by_step_description": [
+    "<шаг 1: подробное описание>",
+    "..."
+  ],
+  "security_issues": [
+    "<проблема безопасности 1>",
+    "..."
+  ]
+}
+
+Правила для bounding_boxes:
+- x, y — нормализованные координаты левого верхнего угла элемента (0.0–1.0)
+- w, h — нормализованные ширина и высота (доля от размеров изображения)
+- Укажи bounding box для каждого элемента из detected_elements
+
+Правила для security_issues:
+- Перечисли архитектурные проблемы безопасности, видимые в диаграмме: отсутствие аутентификации/авторизации, незащищённые потоки данных, отсутствие обработки ошибок, потенциальные DoS-векторы, нарушения принципа наименьших привилегий и т.д.
+- Если явных проблем нет — верни пустой список []
+
+Верни ТОЛЬКО JSON-объект."""
+
+
+def _parse_model_json(text: str) -> Dict[str, Any]:
+    """Извлекает JSON из ответа модели, устойчив к markdown-обёрткам."""
+    text = text.strip()
+    # убираем ```json ... ``` или ``` ... ```
+    text = re.sub(r"^```(?:json)?\s*", "", text)
+    text = re.sub(r"\s*```$", "", text.strip())
+    text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, re.DOTALL)
+        if match:
+            return json.loads(match.group())
+        raise ValueError(f"Не удалось разобрать JSON из ответа модели: {text[:300]}")
 
 
 # ──────────────────────────────────────────────────────────────────────────
@@ -58,6 +135,13 @@ def _demo_result(diagram_type: str = "BPMN Process Diagram") -> Dict[str, Any]:
             "Если товар есть — выполняется задача «Оплата».",
             "Конечное событие: процесс завершается, заказ переходит в «Оплачен».",
         ],
+        "security_issues": [
+            "Отсутствует проверка прав доступа перед задачей «Оплата» — любой участник может инициировать платёж.",
+            "Данные заказа передаются между задачами без явного указания шифрования канала.",
+            "Шлюз «Товар в наличии?» не предусматривает ветку обработки ошибок — процесс может зависнуть.",
+            "Задача «Проверка заказа» не имеет таймаута, что открывает вектор для DoS-атаки.",
+            "Отсутствует событие аудита после «Оплата» — невозможно восстановить историю транзакций.",
+        ],
     }
 
 
@@ -76,6 +160,12 @@ class State(rx.State):
     relationships: List[str] = []
     step_by_step_description: List[str] = []
     bounding_boxes: List[BBox] = []
+    security_issues: List[str] = []
+    error_message: str = ""
+
+    @rx.var
+    def has_error(self) -> bool:
+        return self.diagram_type == "Ошибка" and bool(self.error_message)
 
     # ── Вспомогательное ────────────────────────────────────────────────
     @rx.var
@@ -99,50 +189,64 @@ class State(rx.State):
     #   step_by_step_description
 
     async def _infer_gemini(self, image_bytes: bytes) -> Dict[str, Any]:
-        """Облачный инференс через Gemini 3.1 Pro.
-        Зависимости: pip install google-genai; ключ в GEMINI_API_KEY.
-        В промпте попроси нормализованные координаты боксов."""
-        # import os
-        # from google import genai
-        # client = genai.Client(api_key=os.environ["GEMINI_API_KEY"])
-        # response = client.models.generate_content(
-        #     model="gemini-3.1-pro",
-        #     contents=[{
-        #         "role": "user",
-        #         "parts": [
-        #             {"inline_data": {"mime_type": "image/png", "data": image_bytes}},
-        #             {"text": PROMPT_RU},
-        #         ],
-        #     }],
-        # )
-        # return _parse_model_json(response.text)
-        await asyncio.sleep(1.0)
-        return _demo_result()
+        """Инференс через Gemini 3.1 Pro via OpenAI-compatible Cloudflare Worker.
+
+        Воркер возвращает SSE-стрим независимо от запроса, поэтому используем stream=True.
+        """
+        client = AsyncOpenAI(base_url=GEMINI_BASE_URL, api_key=GEMINI_API_KEY)
+        image_b64 = base64.b64encode(image_bytes).decode("utf-8")
+        stream = await client.chat.completions.create(
+            model=GEMINI_MODEL,
+            messages=[
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": BPMN_ANALYSIS_PROMPT},
+                        {
+                            "type": "image_url",
+                            "image_url": {"url": f"data:image/png;base64,{image_b64}"},
+                        },
+                    ],
+                }
+            ],
+            stream=True,
+        )
+        text = ""
+        async for chunk in stream:
+            delta = chunk.choices[0].delta.content
+            if delta:
+                text += delta
+        print(f"[DiagramLIT] Gemini raw response ({len(text)} chars): {text[:300]!r}")
+        return _parse_model_json(text)
 
     async def _infer_local_vlm(self, image_bytes: bytes) -> Dict[str, Any]:
-        """Локальная VLM на GPU с 8 ГБ VRAM.
-        Рекомендация: Qwen2.5-VL-7B-Instruct в 4-bit — хорошо понимает русский
-        и помещается в ~6-7 ГБ. Pixtral-12B в 8 ГБ влезает плохо.
-        ВАЖНО: инференс блокирующий — выноси в asyncio.to_thread."""
-        # result = await asyncio.to_thread(self._run_local_vlm_blocking, image_bytes)
-        # return result
-        await asyncio.sleep(1.5)
-        return _demo_result()
+        """Локальная VLM — не реализована, требует FastAPI-бэкенд на порту 2023."""
+        raise NotImplementedError(
+            f"Локальная VLM ещё не подключена. Запустите FastAPI-бэкенд на {LOCAL_VLM_URL}."
+        )
 
     async def _infer_orangepi(self, image_bytes: bytes) -> Dict[str, Any]:
-        """Пайплайн для OrangePi RV2 (RISC-V, без CUDA):
-          1. YOLOv8 (onnx/ncnn) — детекция блоков (тут боксы);
-          2. OCR (PaddleOCR / Tesseract rus) — текст внутри блоков;
-          3. лёгкая LLM (Qwen2.5-0.5B/1.5B в GGUF) — оборачивает JSON в текст.
-        YOLO даёт пиксели — дели на ширину/высоту для нормализации."""
-        # result = await asyncio.to_thread(self._run_orangepi_blocking, image_bytes)
-        # return result
-        await asyncio.sleep(2.0)
-        return _demo_result()
+        """OrangePi RV2 — не реализована, требует FastAPI-бэкенд на порту 2022."""
+        raise NotImplementedError(
+            f"OrangePi-бэкенд ещё не подключён. Запустите FastAPI-бэкенд на {ORANGEPI_URL}."
+        )
 
     async def handle_upload(self, files: List[rx.UploadFile]):
+        print(
+            f"[DiagramLIT] handle_upload called: {len(files)} file(s), model={self.selected_model!r}"
+        )
         if not files:
             return
+
+        # Сбрасываем результаты предыдущего запроса
+        self.diagram_type = ""
+        self.detected_elements = []
+        self.relationships = []
+        self.step_by_step_description = []
+        self.bounding_boxes = []
+        self.security_issues = []
+        self.error_message = ""
+        self.image_data_url = ""
 
         self.is_uploading = True
         self.uploaded_filename = files[0].filename
@@ -150,7 +254,6 @@ class State(rx.State):
 
         try:
             file_content = await files[0].read()
-
             self.image_data_url = (
                 "data:image/png;base64," + base64.b64encode(file_content).decode()
             )
@@ -164,15 +267,33 @@ class State(rx.State):
             else:
                 result = _demo_result("Неизвестная модель")
 
-            self.diagram_type = result["diagram_type"]
-            self.detected_elements = result["detected_elements"]
-            self.relationships = result["relationships"]
-            self.step_by_step_description = result["step_by_step_description"]
-            self.bounding_boxes = [BBox(**b) for b in result.get("bounding_boxes", [])]
+            self.diagram_type = result.get("diagram_type", "Неизвестный тип")
+            self.detected_elements = result.get("detected_elements", [])
+            self.relationships = result.get("relationships", [])
+            self.step_by_step_description = result.get("step_by_step_description", [])
+            self.security_issues = result.get("security_issues", [])
+
+            boxes: List[BBox] = []
+            for b in result.get("bounding_boxes", []):
+                try:
+                    boxes.append(
+                        BBox(
+                            label=str(b.get("label", "")),
+                            x=float(b.get("x", 0)),
+                            y=float(b.get("y", 0)),
+                            w=float(b.get("w", 0)),
+                            h=float(b.get("h", 0)),
+                        )
+                    )
+                except Exception:
+                    pass
+            self.bounding_boxes = boxes
 
         except Exception as e:
-            print(f"Ошибка: {e}")
+            self.error_message = str(e)
             self.diagram_type = "Ошибка"
+            print(f"[DiagramLIT] Ошибка инференса: {e}")
+            traceback.print_exc()
         finally:
             self.is_uploading = False
 
@@ -186,6 +307,8 @@ class State(rx.State):
         self.relationships = []
         self.step_by_step_description = []
         self.bounding_boxes = []
+        self.security_issues = []
+        self.error_message = ""
 
 
 def navbar():
@@ -214,6 +337,7 @@ def navbar():
         bg="rgba(255, 255, 255, 0.1)",
         backdrop_filter="blur(10px)",
         box_shadow="0 4px 6px -1px rgba(0, 0, 0, 0.1)",
+        width="100%",
     )
 
 
@@ -272,7 +396,7 @@ def model_selector() -> rx.Component:
 
 
 def index() -> rx.Component:
-    return rx.fragment(
+    return rx.box(
         navbar(),
         rx.container(
             rx.vstack(
@@ -439,13 +563,17 @@ def index() -> rx.Component:
                 ),
                 spacing="5",
                 align="stretch",
+                width="100%",
             ),
             max_width="1200px",
+            margin="0 auto",
             padding_x="2em",
             padding_y="3em",
             min_height="calc(100vh - 140px)",
         ),
         footer(),
+        width="100%",
+        min_height="100vh",
     )
 
 
@@ -604,19 +732,97 @@ def steps_panel() -> rx.Component:
     )
 
 
+def security_panel() -> rx.Component:
+    """Панель с уязвимостями архитектуры, видимыми на диаграмме."""
+    return rx.card(
+        rx.vstack(
+            rx.hstack(
+                rx.icon("shield-alert", size=24, color="#e53e3e"),
+                rx.heading("Проблемы безопасности", size="4"),
+                spacing="2",
+                align="center",
+            ),
+            rx.divider(),
+            rx.cond(
+                State.security_issues,
+                rx.box(
+                    rx.vstack(
+                        rx.foreach(
+                            State.security_issues,
+                            lambda issue: rx.hstack(
+                                rx.icon(
+                                    "triangle-alert",
+                                    size=16,
+                                    color="#e53e3e",
+                                    flex_shrink="0",
+                                    margin_top="2px",
+                                ),
+                                rx.text(
+                                    issue,
+                                    font_size="0.9em",
+                                    color="#2d3748",
+                                    line_height="1.5",
+                                ),
+                                spacing="3",
+                                align="start",
+                                width="100%",
+                            ),
+                        ),
+                        spacing="3",
+                        align="start",
+                        width="100%",
+                    ),
+                    width="100%",
+                    max_height="420px",
+                    overflow_y="auto",
+                    padding="1.25em",
+                    bg="#fff5f5",
+                    border="1px solid #fed7d7",
+                    border_radius="10px",
+                ),
+                rx.center(
+                    rx.vstack(
+                        rx.icon("shield-check", size=40, color="#38a169"),
+                        rx.text(
+                            "Уязвимостей не обнаружено",
+                            font_size="0.95em",
+                            font_weight="600",
+                            color="#38a169",
+                        ),
+                        spacing="3",
+                        align="center",
+                    ),
+                    padding="2em",
+                    bg="#f0fff4",
+                    border="1px solid #c6f6d5",
+                    border_radius="10px",
+                    width="100%",
+                ),
+            ),
+            spacing="3",
+            width="100%",
+            align="stretch",
+        ),
+        width="100%",
+        padding="1.5em",
+        border_radius="12px",
+        bg="white",
+    )
+
+
 def results() -> rx.Component:
-    return rx.fragment(
+    return rx.box(
         navbar(),
         rx.container(
             rx.cond(
                 State.diagram_type,
                 rx.vstack(
+                    # ── Заголовок ──────────────────────────────────────────
                     rx.hstack(
                         rx.link(
                             rx.button(
                                 rx.hstack(
-                                    rx.icon("arrow-left", size=16),
-                                    rx.text("Назад"),
+                                    rx.icon("arrow-left", size=16), rx.text("Назад")
                                 ),
                                 variant="outline",
                                 bg="white",
@@ -629,132 +835,206 @@ def results() -> rx.Component:
                         width="100%",
                     ),
                     rx.divider(),
-                    rx.card(
-                        rx.vstack(
-                            rx.hstack(
-                                rx.icon("bar-chart-2", size=24, color="#667eea"),
-                                rx.heading("Тип диаграммы", size="4"),
-                                spacing="2",
-                                align="center",
-                            ),
-                            rx.hstack(
-                                rx.badge(
-                                    State.diagram_type,
-                                    color_scheme="blue",
-                                    variant="soft",
-                                    size="3",
-                                ),
-                                rx.text(
-                                    f"Модель: {State.model_label}",
-                                    font_size="0.8em",
-                                    color="#718096",
-                                ),
-                                spacing="3",
-                                align="center",
-                            ),
-                        ),
-                        spacing="3",
-                        width="100%",
-                        padding="1.5em",
-                        border_radius="12px",
-                        bg="white",
-                    ),
-                    rx.cond(State.image_data_url, diagram_viewer()),
+                    # ── Баннер ошибки ──────────────────────────────────────
                     rx.cond(
-                        State.detected_elements,
+                        State.has_error,
                         rx.card(
-                            rx.vstack(
-                                rx.hstack(
-                                    rx.icon("grid", size=24, color="#667eea"),
-                                    rx.heading("Список элементов", size="4"),
-                                    spacing="2",
-                                    align="center",
-                                ),
-                                rx.flex(
-                                    rx.foreach(
-                                        State.detected_elements,
-                                        lambda el: rx.badge(
-                                            el,
-                                            color_scheme="green",
-                                            variant="soft",
-                                            size="2",
-                                            padding_x="1em",
-                                            padding_y="0.5em",
-                                            border_radius="8px",
-                                        ),
+                            rx.hstack(
+                                rx.icon("circle-x", size=28, color="#e53e3e"),
+                                rx.vstack(
+                                    rx.heading(
+                                        "Ошибка при обработке",
+                                        size="4",
+                                        color="#e53e3e",
                                     ),
-                                    wrap="wrap",
-                                    spacing="2",
-                                    gap="2",
+                                    rx.text(
+                                        State.error_message,
+                                        font_size="0.9em",
+                                        color="#2d3748",
+                                        word_break="break-word",
+                                    ),
+                                    spacing="1",
+                                    align="start",
                                 ),
+                                spacing="4",
+                                align="start",
+                                width="100%",
                             ),
-                            spacing="3",
                             width="100%",
                             padding="1.5em",
                             border_radius="12px",
-                            bg="white",
+                            bg="#fff5f5",
+                            border="1px solid #fed7d7",
                         ),
                     ),
+                    # ── Основной контент (только без ошибки) ───────────────
                     rx.cond(
-                        State.relationships,
-                        rx.card(
-                            rx.vstack(
-                                rx.hstack(
-                                    rx.icon("share-2", size=24, color="#667eea"),
-                                    rx.heading("Связи между элементами", size="4"),
-                                    spacing="2",
-                                    align="center",
-                                ),
+                        ~State.has_error,
+                        rx.vstack(
+                            rx.card(
                                 rx.vstack(
-                                    rx.foreach(
-                                        State.relationships,
-                                        lambda rel: rx.hstack(
-                                            rx.icon("link-2", size=14, color="#764ba2"),
-                                            rx.text(rel, font_size="0.95em", color="#2d3748"),
+                                    rx.hstack(
+                                        rx.icon(
+                                            "bar-chart-2", size=24, color="#667eea"
+                                        ),
+                                        rx.heading("Тип диаграммы", size="4"),
+                                        spacing="2",
+                                        align="center",
+                                    ),
+                                    rx.hstack(
+                                        rx.badge(
+                                            State.diagram_type,
+                                            color_scheme="blue",
+                                            variant="soft",
+                                            size="3",
+                                        ),
+                                        rx.text(
+                                            f"Модель: {State.model_label}",
+                                            font_size="0.8em",
+                                            color="#718096",
+                                        ),
+                                        spacing="3",
+                                        align="center",
+                                    ),
+                                ),
+                                spacing="3",
+                                width="100%",
+                                padding="1.5em",
+                                border_radius="12px",
+                                bg="white",
+                            ),
+                            rx.cond(State.image_data_url, diagram_viewer()),
+                            rx.cond(
+                                State.detected_elements,
+                                rx.card(
+                                    rx.vstack(
+                                        rx.hstack(
+                                            rx.icon("grid", size=24, color="#667eea"),
+                                            rx.heading("Список элементов", size="4"),
                                             spacing="2",
                                             align="center",
                                         ),
+                                        rx.flex(
+                                            rx.foreach(
+                                                State.detected_elements,
+                                                lambda el: rx.badge(
+                                                    el,
+                                                    color_scheme="green",
+                                                    variant="soft",
+                                                    size="2",
+                                                    padding_x="1em",
+                                                    padding_y="0.5em",
+                                                    border_radius="8px",
+                                                ),
+                                            ),
+                                            wrap="wrap",
+                                            spacing="2",
+                                            gap="2",
+                                        ),
                                     ),
-                                    spacing="2",
-                                    align="start",
+                                    spacing="3",
+                                    width="100%",
+                                    padding="1.5em",
+                                    border_radius="12px",
+                                    bg="white",
+                                ),
+                            ),
+                            rx.cond(
+                                State.relationships,
+                                rx.card(
+                                    rx.vstack(
+                                        rx.hstack(
+                                            rx.icon(
+                                                "share-2", size=24, color="#667eea"
+                                            ),
+                                            rx.heading(
+                                                "Связи между элементами", size="4"
+                                            ),
+                                            spacing="2",
+                                            align="center",
+                                        ),
+                                        rx.vstack(
+                                            rx.foreach(
+                                                State.relationships,
+                                                lambda rel: rx.hstack(
+                                                    rx.icon(
+                                                        "link-2",
+                                                        size=14,
+                                                        color="#764ba2",
+                                                    ),
+                                                    rx.text(
+                                                        rel,
+                                                        font_size="0.95em",
+                                                        color="#2d3748",
+                                                    ),
+                                                    spacing="2",
+                                                    align="center",
+                                                ),
+                                            ),
+                                            spacing="2",
+                                            align="start",
+                                            width="100%",
+                                        ),
+                                    ),
+                                    spacing="3",
+                                    width="100%",
+                                    padding="1.5em",
+                                    border_radius="12px",
+                                    bg="white",
+                                ),
+                            ),
+                            rx.cond(
+                                State.step_by_step_description,
+                                rx.grid(
+                                    steps_panel(),
+                                    security_panel(),
+                                    columns="2",
+                                    gap="6",
                                     width="100%",
                                 ),
                             ),
-                            spacing="3",
+                            spacing="6",
+                            align="stretch",
                             width="100%",
-                            padding="1.5em",
-                            border_radius="12px",
-                            bg="white",
                         ),
                     ),
-                    rx.cond(State.step_by_step_description, steps_panel()),
-                    spacing="6",
+                    spacing="4",
                     align="stretch",
+                    width="100%",
                 ),
+                # ── Spinner пока diagram_type не заполнен ──────────────────
                 rx.center(
                     rx.hstack(
                         rx.spinner(size="3", color="#667eea"),
-                        rx.text("Загрузка результатов...", color="white", font_size="1.1em"),
+                        rx.text(
+                            "Загрузка результатов...",
+                            color="white",
+                            font_size="1.1em",
+                        ),
                         spacing="3",
                         align="center",
                     ),
                     min_height="60vh",
                 ),
             ),
-            max_width="1000px",
+            max_width="1400px",
+            margin="0 auto",
             padding_x="2em",
             padding_y="3em",
             min_height="calc(100vh - 140px)",
         ),
         footer(),
+        width="100%",
+        min_height="100vh",
     )
+
 
 style = {
     "font_family": "system-ui, -apple-system, 'Segoe UI', Roboto, Helvetica, Arial, sans-serif",
     "background": "linear-gradient(135deg, #667eea 0%, #764ba2 100%)",
     "background_attachment": "fixed",
 }
-
+print("start")
 app = rx.App(style=style)
 app.add_page(index, route="/", title="DiagramLIT — Анализ диаграмм")
 app.add_page(results, route="/results", title="Результаты — DiagramLIT")
