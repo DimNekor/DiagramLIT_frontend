@@ -6,7 +6,7 @@ import json
 import os
 import re
 import traceback
-from typing import List, Dict, Any
+from typing import Any, Dict, List
 
 from dotenv import load_dotenv
 from openai import AsyncOpenAI
@@ -179,6 +179,7 @@ class State(rx.State):
 
     is_uploading: bool = False
     retry_message: str = ""
+    cancel_requested: bool = False
 
     selected_model: str = "gemini"
     image_data_url: str = ""
@@ -219,89 +220,132 @@ class State(rx.State):
         self.error_message = ""
         self.retry_message = ""
         self.image_data_url = ""
+        self.cancel_requested = False
 
-    def begin_upload(self, files=None):
-        self.is_uploading = True
-        self._reset_results()
-
+    # ── Шаг 1. Быстрый обработчик загрузки: только принять файл ──────────
     async def handle_upload(self, files: List[rx.UploadFile]):
-        print(
-            f"[DiagramLIT] handle_upload: {len(files)} file(s), model={self.selected_model!r}"
-        )
+        """Включает спиннер, читает файл и СРАЗУ завершается, передавая
+        тяжёлую работу фоновой задаче run_analysis. Никакого инференса здесь!
+        Обработчик быстрый, поэтому спиннер появляется почти мгновенно."""
         if not files:
             self.is_uploading = False
             return
-
+        self._reset_results()
         self.is_uploading = True
         self.uploaded_filename = files[0].filename
-        yield  # отправляем анимацию немедленно
+        yield  # отправляем спиннер клиенту до чтения файла
+        file_content = await files[0].read()
+        self.image_data_url = (
+            "data:image/png;base64," + base64.b64encode(file_content).decode()
+        )
+        # Цепляем фоновую задачу — она не блокирует state и шлёт
+        # обновления по websocket, поэтому спиннер и ретраи видны всегда.
+        yield State.run_analysis
 
+    # ── Шаг 2. Тяжёлый инференс в фоне ────────────────────────────────────
+    @rx.event(background=True)
+    async def run_analysis(self):
+        """Фоновая задача: не держит блокировку состояния, поэтому UI
+        остаётся живым (включая кнопку «Отменить»)."""
         try:
-            file_content = await files[0].read()
-            self.image_data_url = (
-                "data:image/png;base64," + base64.b64encode(file_content).decode()
-            )
+            async with self:
+                if not self.image_data_url:
+                    self.is_uploading = False
+                    return
+                image_bytes = base64.b64decode(
+                    self.image_data_url.split(",", 1)[1]
+                )
+                model_key = self.selected_model
 
+            infer = INFER_FUNCS.get(model_key)
             result: Dict[str, Any] | None = None
-            last_error: Exception | None = None
+            error: Exception | None = None
 
             for attempt in range(3):
                 try:
-                    infer = INFER_FUNCS.get(self.selected_model)
                     if infer is None:
                         result = _demo_result("Неизвестная модель")
                     else:
-                        result = await infer(file_content)
+                        result = await infer(image_bytes)
+                    error = None
                     break
                 except Exception as e:
-                    last_error = e
-                    if "429" in str(e) and attempt < 2:
-                        wait = 35
+                    error = e
+                    if "429" not in str(e) or attempt >= 2:
+                        break
+                    wait = 35
+                    async with self:
+                        if self.cancel_requested:
+                            return
                         self.retry_message = (
                             f"Лимит запросов API. "
                             f"Повтор {attempt + 1}/2 через {wait} сек..."
                         )
-                        yield
-                        await asyncio.sleep(wait)
+                    await asyncio.sleep(wait)
+                    async with self:
                         self.retry_message = ""
-                    else:
-                        raise
+                        if self.cancel_requested:
+                            return
 
-            if result is None:
-                raise last_error or Exception("Неизвестная ошибка")
-
-            self.diagram_type = result.get("diagram_type", "Неизвестный тип")
-            self.detected_elements = result.get("detected_elements", [])
-            self.relationships = result.get("relationships", [])
-            self.step_by_step_description = result.get("step_by_step_description", [])
-            self.security_issues = result.get("security_issues", [])
-
-            boxes: List[BBox] = []
-            for b in result.get("bounding_boxes", []):
-                try:
-                    boxes.append(
-                        BBox(
-                            label=str(b.get("label", "")),
-                            x=float(b.get("x", 0)),
-                            y=float(b.get("y", 0)),
-                            w=float(b.get("w", 0)),
-                            h=float(b.get("h", 0)),
-                        )
+            cancelled = False
+            async with self:
+                cancelled = self.cancel_requested
+                self.is_uploading = False
+                self.retry_message = ""
+                if cancelled:
+                    return
+                if error is not None or result is None:
+                    self.error_message = (
+                        str(error) if error else "Неизвестная ошибка"
                     )
-                except Exception:
-                    pass
-            self.bounding_boxes = boxes
+                    self.diagram_type = "Ошибка"
+                    print(f"[DiagramLIT] Ошибка: {error}")
+                else:
+                    self.diagram_type = result.get(
+                        "diagram_type", "Неизвестный тип"
+                    )
+                    self.detected_elements = result.get("detected_elements", [])
+                    self.relationships = result.get("relationships", [])
+                    self.step_by_step_description = result.get(
+                        "step_by_step_description", []
+                    )
+                    self.security_issues = result.get("security_issues", [])
+
+                    boxes: List[BBox] = []
+                    for b in result.get("bounding_boxes", []):
+                        try:
+                            boxes.append(
+                                BBox(
+                                    label=str(b.get("label", "")),
+                                    x=float(b.get("x", 0)),
+                                    y=float(b.get("y", 0)),
+                                    w=float(b.get("w", 0)),
+                                    h=float(b.get("h", 0)),
+                                )
+                            )
+                        except Exception:
+                            pass
+                    self.bounding_boxes = boxes
+
+            yield rx.redirect("/results")
 
         except Exception as e:
-            self.error_message = str(e)
-            self.diagram_type = "Ошибка"
-            print(f"[DiagramLIT] Ошибка: {e}")
+            # Страховка: что бы ни случилось, спиннер НЕ зависнет.
             traceback.print_exc()
-        finally:
-            self.is_uploading = False
-            self.retry_message = ""
+            async with self:
+                self.is_uploading = False
+                self.retry_message = ""
+                self.error_message = str(e)
+                self.diagram_type = "Ошибка"
+            yield rx.redirect("/results")
 
-        yield rx.redirect("/results")
+    # ── Аварийный выход из спиннера ───────────────────────────────────────
+    def cancel_analysis(self):
+        """Кнопка «Отменить» на спиннере: мгновенно возвращает форму,
+        а фоновая задача увидит флаг и тихо завершится без redirect."""
+        self.cancel_requested = True
+        self.is_uploading = False
+        self.retry_message = ""
 
     def clear_upload(self):
         self.uploaded_filename = ""
@@ -506,6 +550,13 @@ def loading_content() -> rx.Component:
                 width="100%",
             ),
         ),
+        rx.button(
+            rx.hstack(rx.icon("x", size=16), rx.text("Отменить"), spacing="2"),
+            on_click=State.cancel_analysis,
+            variant="outline",
+            color_scheme="gray",
+            size="2",
+        ),
         spacing="5",
         align="center",
         width="100%",
@@ -586,6 +637,8 @@ def index() -> rx.Component:
                                     spacing="3",
                                     align="center",
                                 ),
+                                # handle_upload быстрый: включает спиннер,
+                                # сохраняет файл и уходит в фоновую задачу.
                                 on_drop=State.handle_upload(
                                     rx.upload_files(upload_id="diagramlit_upload")
                                 ),
@@ -927,6 +980,38 @@ def security_panel() -> rx.Component:
     )
 
 
+def no_results_placeholder() -> rx.Component:
+    """Вместо вечного спиннера: понятное состояние «результатов нет»."""
+    return rx.center(
+        rx.vstack(
+            rx.icon("file-question", size=48, color="white"),
+            rx.text(
+                "Результатов анализа пока нет",
+                color="white",
+                font_size="1.2em",
+                font_weight="600",
+            ),
+            rx.text(
+                "Загрузите диаграмму на главной странице",
+                color="#e2e8f0",
+                font_size="0.95em",
+            ),
+            rx.link(
+                rx.button(
+                    rx.hstack(rx.icon("arrow-left", size=16), rx.text("На главную")),
+                    variant="solid",
+                    color_scheme="blue",
+                    size="3",
+                ),
+                href="/",
+            ),
+            spacing="4",
+            align="center",
+        ),
+        min_height="60vh",
+    )
+
+
 def results() -> rx.Component:
     return rx.box(
         navbar(),
@@ -1121,19 +1206,36 @@ def results() -> rx.Component:
                     align="stretch",
                     width="100%",
                 ),
-                # ── Spinner пока diagram_type не заполнен ──────────────────
-                rx.center(
-                    rx.hstack(
-                        rx.spinner(size="3", color="#667eea"),
-                        rx.text(
-                            "Загрузка результатов...",
-                            color="white",
-                            font_size="1.1em",
+                # ── diagram_type пуст: либо анализ ещё идёт, либо его нет ──
+                rx.cond(
+                    State.is_uploading,
+                    rx.center(
+                        rx.vstack(
+                            rx.hstack(
+                                rx.spinner(size="3", color="#667eea"),
+                                rx.text(
+                                    "Анализ ещё выполняется...",
+                                    color="white",
+                                    font_size="1.1em",
+                                ),
+                                spacing="3",
+                                align="center",
+                            ),
+                            rx.button(
+                                rx.hstack(
+                                    rx.icon("x", size=16), rx.text("Отменить")
+                                ),
+                                on_click=State.cancel_analysis,
+                                variant="outline",
+                                bg="white",
+                                size="2",
+                            ),
+                            spacing="4",
+                            align="center",
                         ),
-                        spacing="3",
-                        align="center",
+                        min_height="60vh",
                     ),
-                    min_height="60vh",
+                    no_results_placeholder(),
                 ),
             ),
             max_width="1400px",
