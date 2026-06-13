@@ -797,23 +797,23 @@ def index() -> rx.Component:
 
 
 def bbox_overlay(box: BBox) -> rx.Component:
-    """Одна красная рамка поверх изображения + подпись."""
+    """Красная рамка + прозрачный текст с белой обводкой и уменьшенным шрифтом."""
     return rx.box(
+        # Внутренний контейнер для текста
         rx.box(
             rx.text(
                 box.label,
-                font_size="0.8em",
+                font_size="0.65em",
                 font_weight="900",
                 color="#e53e3e",
                 white_space="nowrap",
-                text_shadow="1px 1px 0px rgba(255,255,255,0.8), -1px -1px 0px rgba(255,255,255,0.8), 1px -1px 0px rgba(255,255,255,0.8), -1px 1px 0px rgba(255,255,255,0.8)",
+                text_shadow="1px 1px 0px rgba(255,255,255,0.9), -1px -1px 0px rgba(255,255,255,0.9), 1px -1px 0px rgba(255,255,255,0.9), -1px 1px 0px rgba(255,255,255,0.9)",
             ),
             position="absolute",
-            top="-1.6em",
+            top="-1.3em",
             left="-2px",
             bg="transparent",
-            padding_x="0.2em",
-            padding_y="0.05em",
+            padding="0",
         ),
         position="absolute",
         left=f"{box.x * 100}%",
