@@ -2,6 +2,7 @@ import reflex as rx
 from pydantic import BaseModel
 import asyncio
 import base64
+import httpx
 import json
 import os
 import re
@@ -81,6 +82,8 @@ BPMN_ANALYSIS_PROMPT = """
 
 Верни ТОЛЬКО JSON-объект.
 """
+
+
 def _parse_model_json(text: str) -> Dict[str, Any]:
     """Извлекает JSON из ответа модели, устойчив к markdown-обёрткам."""
     text = text.strip()
@@ -177,9 +180,46 @@ async def _infer_local_vlm(image_bytes: bytes) -> Dict[str, Any]:
 
 
 async def _infer_orangepi(image_bytes: bytes) -> Dict[str, Any]:
-    raise NotImplementedError(
-        f"OrangePi-бэкенд ещё не подключён. Запустите FastAPI-бэкенд на {ORANGEPI_URL}."
-    )
+    """Отправляет изображение на локальный FastAPI-бэкенд (OrangePi) через SSH-туннель."""
+
+    # 1. Формируем URL. Берем базовый адрес из .env (по умолчанию http://localhost:2022)
+    # и добавляем эндпоинт /infer, который прописан в FastAPI.
+    base_url = ORANGEPI_URL.rstrip("/")
+    url = f"{base_url}/infer"
+
+    # 2. Подготавливаем файл для отправки (multipart/form-data).
+    # Ключ "file" должен строго совпадать с названием параметра в функции predict_diagram(file: UploadFile = File(...))
+    files = {"file": ("diagram.png", image_bytes, "image/png")}
+
+    # 3. Отправляем асинхронный POST-запрос.
+    # Таймаут увеличен до 60 секунд, так как инференс нейросети занимает время.
+    async with httpx.AsyncClient(timeout=60.0) as client:
+        try:
+            response = await client.post(url, files=files)
+
+            # Если бэкенд вернул ошибку (например, 500 Internal Server Error), выбрасываем исключение
+            response.raise_for_status()
+
+            # FastAPI автоматически сериализует ответ в JSON, просто парсим его
+            return response.json()
+
+        except httpx.ConnectError:
+            raise RuntimeError(
+                f"Не удалось подключиться к OrangePi по адресу {url}. "
+                "Убедитесь, что FastAPI запущен, а обратный SSH-туннель на порту 2022 активен."
+            )
+        except httpx.TimeoutException:
+            raise RuntimeError(
+                "Таймаут: OrangePi обрабатывает диаграмму слишком долго (более 60 секунд)."
+            )
+        except httpx.HTTPStatusError as e:
+            raise RuntimeError(
+                f"Ошибка на стороне FastAPI (код {e.response.status_code}): {e.response.text}"
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"Непредвиденная ошибка при запросе к OrangePi: {str(e)}"
+            )
 
 
 INFER_FUNCS = {
@@ -267,9 +307,7 @@ class State(rx.State):
                 if not self.image_data_url:
                     self.is_uploading = False
                     return
-                image_bytes = base64.b64decode(
-                    self.image_data_url.split(",", 1)[1]
-                )
+                image_bytes = base64.b64decode(self.image_data_url.split(",", 1)[1])
                 model_key = self.selected_model
 
             infer = INFER_FUNCS.get(model_key)
@@ -310,15 +348,11 @@ class State(rx.State):
                 if cancelled:
                     return
                 if error is not None or result is None:
-                    self.error_message = (
-                        str(error) if error else "Неизвестная ошибка"
-                    )
+                    self.error_message = str(error) if error else "Неизвестная ошибка"
                     self.diagram_type = "Ошибка"
                     print(f"[DiagramLIT] Ошибка: {error}")
                 else:
-                    self.diagram_type = result.get(
-                        "diagram_type", "Неизвестный тип"
-                    )
+                    self.diagram_type = result.get("diagram_type", "Неизвестный тип")
                     self.detected_elements = result.get("detected_elements", [])
                     self.relationships = result.get("relationships", [])
                     self.step_by_step_description = result.get(
@@ -1237,9 +1271,7 @@ def results() -> rx.Component:
                                 align="center",
                             ),
                             rx.button(
-                                rx.hstack(
-                                    rx.icon("x", size=16), rx.text("Отменить")
-                                ),
+                                rx.hstack(rx.icon("x", size=16), rx.text("Отменить")),
                                 on_click=State.cancel_analysis,
                                 variant="outline",
                                 bg="white",

@@ -67,6 +67,7 @@ name = "diagramlit-frontend"
 version = "0.1.0"
 source = { virtual = "." }
 dependencies = [
+    { name = "httpx" },
     { name = "openai" },
     { name = "python-dotenv" },
     { name = "reflex" },
@@ -74,6 +75,7 @@ dependencies = [
 
 [package.metadata]
 requires-dist = [
+    { name = "httpx", specifier = ">=0.28.1" },
     { name = "openai", specifier = ">=2.41.0" },
     { name = "python-dotenv", specifier = ">=1.2.2" },
     { name = "reflex", specifier = ">=0.9.4" },
