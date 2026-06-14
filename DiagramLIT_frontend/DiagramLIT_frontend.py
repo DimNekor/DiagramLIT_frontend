@@ -96,7 +96,6 @@ def _parse_model_json(text: str) -> Dict[str, Any]:
     text = text.strip()
     
     # ИСПОЛЬЗУЕМ HEX-КОД СИМВОЛА \x60 ВМЕСТО САМИХ КАВЫЧЕК
-    # Это предотвращает поломку UI-редактора
     text = re.sub(r"^\x60{3}(?:json)?\s*", "", text)
     text = re.sub(r"\s*\x60{3}$", "", text.strip())
     text = text.strip()
@@ -208,11 +207,8 @@ class State(rx.State):
     llm_job_id: str = ""
 
     selected_model: str = "gemini"
-    
-    # Сохраняем только путь к файлу
     image_path: str = ""
     
-    uploaded_filename: str = ""
     diagram_type: str = ""
     detected_elements: List[str] = []
     relationships: List[str] = []
@@ -275,27 +271,29 @@ class State(rx.State):
 
     async def handle_upload(self, files: List[rx.UploadFile]):
         if not files:
-            self.is_uploading = False
             return
         self._reset_results()
         self.is_uploading = True
-        self.uploaded_filename = files[0].filename
-        yield  # отправляем спиннер клиенту до чтения файла
+        yield  # Обновляем UI, показываем спиннер
         
-        file_content = await files[0].read()
-        
-        # Генерируем безопасное имя и сохраняем в assets/
-        safe_filename = f"diagram_{uuid.uuid4().hex[:8]}.png"
-        os.makedirs("assets", exist_ok=True)
-        file_path = os.path.join("assets", safe_filename)
-        
-        with open(file_path, "wb") as f:
-            f.write(file_content)
+        try:
+            file_content = await files[0].read()
             
-        # В State пишем только строку пути
-        self.image_path = f"/{safe_filename}"
-        
-        yield State.run_analysis
+            safe_filename = f"diagram_{uuid.uuid4().hex[:8]}.png"
+            os.makedirs("assets", exist_ok=True)
+            file_path = os.path.join("assets", safe_filename)
+            
+            with open(file_path, "wb") as f:
+                f.write(file_content)
+                
+            self.image_path = f"/{safe_filename}"
+            yield State.run_analysis
+            
+        except Exception as e:
+            self.is_uploading = False
+            self.error_message = f"Ошибка чтения файла: {e}"
+            self.diagram_type = "Ошибка"
+            yield rx.redirect("/results")
 
     async def _infer_with_heartbeat(self, infer, image_bytes: bytes) -> Dict[str, Any]:
         task = asyncio.create_task(infer(image_bytes))
@@ -324,7 +322,6 @@ class State(rx.State):
                     return
                 model_key = self.selected_model
                 
-            # Читаем байты из локального файла
             local_path = os.path.join("assets", self.image_path.lstrip("/"))
             try:
                 with open(local_path, "rb") as f:
@@ -474,11 +471,12 @@ class State(rx.State):
         self.retry_message = ""
         self.progress_message = ""
         self.llm_status = ""
+        return rx.clear_selected_files("diagramlit_upload")
 
     def clear_upload(self):
-        self.uploaded_filename = ""
         self.image_path = ""
         self._reset_results()
+        return rx.clear_selected_files("diagramlit_upload")
 
 
 def navbar():
@@ -491,45 +489,23 @@ def navbar():
         ),
         rx.hstack(
             rx.link("Главная", href="/", color="white", font_weight="500"),
-            rx.link(
-                "GitHub",
-                href="https://github.com",
-                color="white",
-                font_weight="500",
-                is_external=True,
-            ),
+            rx.link("GitHub", href="https://github.com", color="white", font_weight="500", is_external=True),
             spacing="4",
         ),
-        justify="between",
-        align="center",
-        padding_x="2em",
-        padding_y="1em",
-        bg="rgba(255, 255, 255, 0.1)",
-        backdrop_filter="blur(10px)",
-        box_shadow="0 4px 6px -1px rgba(0, 0, 0, 0.1)",
-        width="100%",
+        justify="between", align="center", padding_x="2em", padding_y="1em",
+        bg="rgba(255, 255, 255, 0.1)", backdrop_filter="blur(10px)",
+        box_shadow="0 4px 6px -1px rgba(0, 0, 0, 0.1)", width="100%",
     )
 
 
 def footer():
     return rx.center(
         rx.vstack(
-            rx.text(
-                "© 2026 DiagramLIT — AI-powered Diagram Analysis",
-                font_size="0.8em",
-                color="#a0aec0",
-            ),
-            rx.text(
-                "Распознавание BPMN-диаграмм",
-                font_size="0.7em",
-                color="#a0aec0",
-            ),
-            align="center",
-            spacing="1",
+            rx.text("© 2026 DiagramLIT — AI-powered Diagram Analysis", font_size="0.8em", color="#a0aec0"),
+            rx.text("Распознавание BPMN-диаграмм", font_size="0.7em", color="#a0aec0"),
+            align="center", spacing="1",
         ),
-        padding="2em",
-        bg="rgba(0, 0, 0, 0.3)",
-        width="100%",
+        padding="2em", bg="rgba(0, 0, 0, 0.3)", width="100%",
     )
 
 
@@ -537,14 +513,8 @@ def model_selector() -> rx.Component:
     return rx.vstack(
         rx.hstack(
             rx.icon("cpu", size=20, color="#667eea"),
-            rx.text(
-                "Устройство и модель",
-                font_size="0.95em",
-                font_weight="600",
-                color="#1a202c",
-            ),
-            spacing="2",
-            align="center",
+            rx.text("Устройство и модель", font_size="0.95em", font_weight="600", color="#1a202c"),
+            spacing="2", align="center",
         ),
         rx.select.root(
             rx.select.trigger(placeholder="Выберите модель", width="100%"),
@@ -559,70 +529,28 @@ def model_selector() -> rx.Component:
             on_change=State.set_selected_model,
             width="100%",
         ),
-        spacing="2",
-        align="start",
-        width="100%",
+        spacing="2", align="start", width="100%",
     )
 
 
 def loading_content() -> rx.Component:
     return rx.vstack(
-        rx.html(
-            "<style>"
-            "@keyframes dl-spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}"
-            "@keyframes dl-fadein{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}"
-            "</style>"
-        ),
-        rx.box(
-            style={
-                "width": "72px",
-                "height": "72px",
-                "border": "5px solid #e2e8f0",
-                "border-top-color": "#667eea",
-                "border-radius": "50%",
-                "animation": "dl-spin 1s linear infinite",
-                "margin": "0 auto",
-            },
-        ),
-        rx.vstack(
-            rx.heading("Анализируем диаграмму", size="5", color="#1a202c"),
-            rx.text(
-                f"Модель: {State.model_label}",
-                font_size="0.85em",
-                color="#718096",
-            ),
-            spacing="1",
-            align="center",
-        ),
+        rx.spinner(size="3", color="#667eea"),
+        rx.heading("Анализируем диаграмму", size="5", color="#1a202c"),
+        rx.text(f"Модель: {State.model_label}", font_size="0.85em", color="#718096"),
         rx.divider(),
         rx.vstack(
             rx.hstack(
-                rx.text("✓", color="#38a169", font_weight="700", font_size="1.1em", min_width="1.8em"),
+                rx.icon("check-circle-2", color="#38a169", size=20),
                 rx.text("Изображение загружено", font_size="0.95em", color="#2d3748"),
-                align="center",
-                width="100%",
-                style={"animation": "dl-fadein 0.5s ease 0.3s forwards", "opacity": "0"},
+                align="center", width="100%",
             ),
             rx.hstack(
                 rx.spinner(size="1", color="#667eea"),
                 rx.text("Отправляем в модель...", font_size="0.95em", color="#2d3748"),
-                spacing="3",
-                align="center",
-                width="100%",
-                style={"animation": "dl-fadein 0.5s ease 1.5s forwards", "opacity": "0"},
+                spacing="3", align="center", width="100%",
             ),
-            rx.hstack(
-                rx.spinner(size="1", color="#667eea"),
-                rx.text("Распознаём элементы...", font_size="0.95em", color="#2d3748"),
-                spacing="3",
-                align="center",
-                width="100%",
-                style={"animation": "dl-fadein 0.5s ease 5.0s forwards", "opacity": "0"},
-            ),
-            spacing="3",
-            align="start",
-            width="100%",
-            padding_x="0.5em",
+            spacing="3", align="start", width="100%", padding_x="1em",
         ),
         rx.cond(
             State.progress_message,
@@ -630,15 +558,6 @@ def loading_content() -> rx.Component:
                 rx.spinner(size="1", color="#667eea"),
                 rx.text(State.progress_message, font_size="0.85em", color="#4a5568", font_weight="500"),
                 spacing="2", align="center", bg="#edf2ff", border="1px solid #c3dafe",
-                border_radius="8px", padding_x="1em", padding_y="0.6em", width="100%",
-            ),
-        ),
-        rx.cond(
-            State.retry_message,
-            rx.hstack(
-                rx.spinner(size="1", color="#e07b00"),
-                rx.text(State.retry_message, font_size="0.85em", color="#e07b00", font_weight="500"),
-                spacing="2", align="center", bg="#fffbeb", border="1px solid #fcd34d",
                 border_radius="8px", padding_x="1em", padding_y="0.6em", width="100%",
             ),
         ),
@@ -669,9 +588,14 @@ def index() -> rx.Component:
                     spacing="3", align="center", width="100%", padding_bottom="2em",
                 ),
                 rx.card(
-                    rx.cond(
-                        State.is_uploading,
+                    # Окно загрузки (скрыто, пока не начата загрузка)
+                    rx.box(
                         loading_content(),
+                        display=rx.cond(State.is_uploading, "block", "none"),
+                        width="100%",
+                    ),
+                    # Форма выбора файла (скрыта во время загрузки)
+                    rx.box(
                         rx.vstack(
                             rx.hstack(
                                 rx.icon("upload", size=30, color="#667eea"),
@@ -685,27 +609,40 @@ def index() -> rx.Component:
                             rx.upload(
                                 rx.vstack(
                                     rx.icon("image", size=40, color="#a0aec0"),
-                                    rx.text("Перетащите PNG-файл сюда или", font_size="0.9em", color="#4a5568"),
-                                    rx.button("Выбрать файл", color_scheme="blue", size="3", variant="solid"),
+                                    rx.text("Перетащите PNG-файл сюда или нажмите", font_size="0.9em", color="#4a5568"),
                                     rx.cond(
-                                        State.uploaded_filename,
-                                        rx.badge(f"Файл: {State.uploaded_filename}", color_scheme="green", variant="soft", font_size="0.8em"),
+                                        rx.selected_files("diagramlit_upload"),
+                                        rx.foreach(
+                                            rx.selected_files("diagramlit_upload"),
+                                            lambda f: rx.badge(f"Файл: {f}", color_scheme="green", variant="soft", size="2")
+                                        ),
+                                        rx.text("Файл не выбран", font_size="0.8em", color="#a0aec0"),
                                     ),
                                     spacing="3", align="center",
                                 ),
-                                on_drop=State.handle_upload(rx.upload_files(upload_id="diagramlit_upload")),
                                 id="diagramlit_upload", multiple=False, accept={"image/png": [".png"]},
                                 border="2px dashed #cbd5e0", border_radius="12px", padding="2.5em", bg="#fafafa",
                             ),
                             rx.cond(
-                                State.uploaded_filename,
-                                rx.button(
-                                    rx.hstack(rx.icon("trash-2", size=16), rx.text("Очистить")),
-                                    on_click=State.clear_upload, color_scheme="red", variant="outline", size="2",
-                                ),
+                                rx.selected_files("diagramlit_upload"),
+                                rx.hstack(
+                                    rx.button(
+                                        rx.hstack(rx.icon("play", size=16), rx.text("Начать анализ")),
+                                        on_click=State.handle_upload(rx.upload_files(upload_id="diagramlit_upload")),
+                                        color_scheme="blue", variant="solid", size="3", width="100%"
+                                    ),
+                                    rx.button(
+                                        rx.icon("trash-2", size=18),
+                                        on_click=rx.clear_selected_files("diagramlit_upload"),
+                                        color_scheme="red", variant="outline", size="3",
+                                    ),
+                                    spacing="3", width="100%",
+                                )
                             ),
                             spacing="5", align="stretch", width="100%",
                         ),
+                        display=rx.cond(State.is_uploading, "none", "block"),
+                        width="100%",
                     ),
                     padding="2em", box_shadow="0 10px 15px -3px rgba(0, 0, 0, 0.1)",
                     border_radius="16px", bg="white", min_height="380px",
