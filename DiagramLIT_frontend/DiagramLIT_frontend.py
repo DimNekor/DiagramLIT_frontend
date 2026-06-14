@@ -193,7 +193,7 @@ async def _infer_orangepi(image_bytes: bytes) -> Dict[str, Any]:
 
     # 3. Отправляем асинхронный POST-запрос.
     # Таймаут увеличен до 60 секунд, так как инференс нейросети занимает время.
-    async with httpx.AsyncClient(timeout=60.0) as client:
+    async with httpx.AsyncClient(timeout=900.0) as client:
         try:
             response = await client.post(url, files=files)
 
