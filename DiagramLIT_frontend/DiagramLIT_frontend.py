@@ -92,14 +92,13 @@ BPMN_ANALYSIS_PROMPT = '''
 Верни ТОЛЬКО JSON-объект.
 '''
 
+
 def _parse_model_json(text: str) -> Dict[str, Any]:
     text = text.strip()
-    
     # ИСПОЛЬЗУЕМ HEX-КОД СИМВОЛА \x60 ВМЕСТО САМИХ КАВЫЧЕК
     text = re.sub(r"^\x60{3}(?:json)?\s*", "", text)
     text = re.sub(r"\s*\x60{3}$", "", text.strip())
     text = text.strip()
-    
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -115,12 +114,14 @@ MODEL_BACKENDS: Dict[str, str] = {
     "orangepi": "YOLOv8 + OCR · OrangePi RV2",
 }
 
+
 class BBox(BaseModel):
     label: str
     x: float
     y: float
     w: float
     h: float
+
 
 def _demo_result(diagram_type: str = "BPMN Process Diagram") -> Dict[str, Any]:
     return {
@@ -131,6 +132,7 @@ def _demo_result(diagram_type: str = "BPMN Process Diagram") -> Dict[str, Any]:
         "step_by_step_description": ["Демо-режим: модель не подключена."],
         "security_issues": [],
     }
+
 
 async def _infer_gemini(image_bytes: bytes) -> Dict[str, Any]:
     client = AsyncOpenAI(base_url=GEMINI_BASE_URL, api_key=GEMINI_API_KEY)
@@ -163,8 +165,10 @@ async def _infer_gemini(image_bytes: bytes) -> Dict[str, Any]:
         raise RuntimeError(f"Неожиданный ответ от API: {stripped[:200]}")
     return _parse_model_json(text)
 
+
 async def _infer_local_vlm(image_bytes: bytes) -> Dict[str, Any]:
     raise NotImplementedError(f"Локальная VLM ещё не подключена. Запустите FastAPI-бэкенд на {LOCAL_VLM_URL}.")
+
 
 async def _orangepi_submit(image_bytes: bytes) -> Dict[str, Any]:
     base_url = ORANGEPI_URL.rstrip("/")
@@ -183,6 +187,7 @@ async def _orangepi_submit(image_bytes: bytes) -> Dict[str, Any]:
         except httpx.HTTPStatusError as e:
             raise RuntimeError(f"Ошибка на стороне FastAPI (код {e.response.status_code}): {e.response.text}")
 
+
 async def _orangepi_poll(job_id: str) -> Dict[str, Any]:
     base_url = ORANGEPI_URL.rstrip("/")
     url = f"{base_url}/infer/{job_id}"
@@ -192,10 +197,12 @@ async def _orangepi_poll(job_id: str) -> Dict[str, Any]:
         response.raise_for_status()
         return response.json()
 
+
 INFER_FUNCS = {
     "gemini": _infer_gemini,
     "local_vlm": _infer_local_vlm,
 }
+
 
 class State(rx.State):
     is_uploading: bool = False
@@ -207,7 +214,9 @@ class State(rx.State):
     llm_job_id: str = ""
 
     selected_model: str = "gemini"
+    # Сохраняем ТОЛЬКО путь к файлу для обхода ошибки WebSockets
     image_path: str = ""
+    uploaded_filename: str = ""
     
     diagram_type: str = ""
     detected_elements: List[str] = []
@@ -271,29 +280,23 @@ class State(rx.State):
 
     async def handle_upload(self, files: List[rx.UploadFile]):
         if not files:
+            self.is_uploading = False
             return
         self._reset_results()
         self.is_uploading = True
-        yield  # Обновляем UI, показываем спиннер
+        self.uploaded_filename = files[0].filename
+        yield  # Отправляем триггер для красивого UI спиннера до чтения
         
-        try:
-            file_content = await files[0].read()
+        file_content = await files[0].read()
+        
+        safe_filename = f"diagram_{uuid.uuid4().hex[:8]}.png"
+        os.makedirs("assets", exist_ok=True)
+        file_path = os.path.join("assets", safe_filename)
+        with open(file_path, "wb") as f:
+            f.write(file_content)
             
-            safe_filename = f"diagram_{uuid.uuid4().hex[:8]}.png"
-            os.makedirs("assets", exist_ok=True)
-            file_path = os.path.join("assets", safe_filename)
-            
-            with open(file_path, "wb") as f:
-                f.write(file_content)
-                
-            self.image_path = f"/{safe_filename}"
-            yield State.run_analysis
-            
-        except Exception as e:
-            self.is_uploading = False
-            self.error_message = f"Ошибка чтения файла: {e}"
-            self.diagram_type = "Ошибка"
-            yield rx.redirect("/results")
+        self.image_path = f"/{safe_filename}"
+        yield State.run_analysis
 
     async def _infer_with_heartbeat(self, infer, image_bytes: bytes) -> Dict[str, Any]:
         task = asyncio.create_task(infer(image_bytes))
@@ -306,7 +309,9 @@ class State(rx.State):
                         task.cancel()
                         raise asyncio.CancelledError()
                     elapsed = int(time.monotonic() - start)
-                    self.progress_message = f"Идёт обработка на устройстве… {elapsed // 60}:{elapsed % 60:02d}"
+                    # Выводим сообщение только если долго думает, чтобы не сбивать красивую CSS анимацию
+                    if elapsed > 15:
+                        self.progress_message = f"Ожидание ответа от ИИ… {elapsed // 60}:{elapsed % 60:02d}"
         except asyncio.CancelledError:
             if not task.done():
                 task.cancel()
@@ -471,12 +476,11 @@ class State(rx.State):
         self.retry_message = ""
         self.progress_message = ""
         self.llm_status = ""
-        return rx.clear_selected_files("diagramlit_upload")
 
     def clear_upload(self):
+        self.uploaded_filename = ""
         self.image_path = ""
         self._reset_results()
-        return rx.clear_selected_files("diagramlit_upload")
 
 
 def navbar():
@@ -489,23 +493,45 @@ def navbar():
         ),
         rx.hstack(
             rx.link("Главная", href="/", color="white", font_weight="500"),
-            rx.link("GitHub", href="https://github.com", color="white", font_weight="500", is_external=True),
+            rx.link(
+                "GitHub",
+                href="https://github.com",
+                color="white",
+                font_weight="500",
+                is_external=True,
+            ),
             spacing="4",
         ),
-        justify="between", align="center", padding_x="2em", padding_y="1em",
-        bg="rgba(255, 255, 255, 0.1)", backdrop_filter="blur(10px)",
-        box_shadow="0 4px 6px -1px rgba(0, 0, 0, 0.1)", width="100%",
+        justify="between",
+        align="center",
+        padding_x="2em",
+        padding_y="1em",
+        bg="rgba(255, 255, 255, 0.1)",
+        backdrop_filter="blur(10px)",
+        box_shadow="0 4px 6px -1px rgba(0, 0, 0, 0.1)",
+        width="100%",
     )
 
 
 def footer():
     return rx.center(
         rx.vstack(
-            rx.text("© 2026 DiagramLIT — AI-powered Diagram Analysis", font_size="0.8em", color="#a0aec0"),
-            rx.text("Распознавание BPMN-диаграмм", font_size="0.7em", color="#a0aec0"),
-            align="center", spacing="1",
+            rx.text(
+                "© 2026 DiagramLIT — AI-powered Diagram Analysis",
+                font_size="0.8em",
+                color="#a0aec0",
+            ),
+            rx.text(
+                "Распознавание BPMN-диаграмм",
+                font_size="0.7em",
+                color="#a0aec0",
+            ),
+            align="center",
+            spacing="1",
         ),
-        padding="2em", bg="rgba(0, 0, 0, 0.3)", width="100%",
+        padding="2em",
+        bg="rgba(0, 0, 0, 0.3)",
+        width="100%",
     )
 
 
@@ -513,8 +539,14 @@ def model_selector() -> rx.Component:
     return rx.vstack(
         rx.hstack(
             rx.icon("cpu", size=20, color="#667eea"),
-            rx.text("Устройство и модель", font_size="0.95em", font_weight="600", color="#1a202c"),
-            spacing="2", align="center",
+            rx.text(
+                "Устройство и модель",
+                font_size="0.95em",
+                font_weight="600",
+                color="#1a202c",
+            ),
+            spacing="2",
+            align="center",
         ),
         rx.select.root(
             rx.select.trigger(placeholder="Выберите модель", width="100%"),
@@ -529,44 +561,158 @@ def model_selector() -> rx.Component:
             on_change=State.set_selected_model,
             width="100%",
         ),
-        spacing="2", align="start", width="100%",
+        spacing="2",
+        align="start",
+        width="100%",
     )
 
 
 def loading_content() -> rx.Component:
+    """Точная копия вашей красивой CSS анимации"""
     return rx.vstack(
-        rx.spinner(size="3", color="#667eea"),
-        rx.heading("Анализируем диаграмму", size="5", color="#1a202c"),
-        rx.text(f"Модель: {State.model_label}", font_size="0.85em", color="#718096"),
+        rx.html(
+            "<style>"
+            "@keyframes dl-spin{from{transform:rotate(0deg)}to{transform:rotate(360deg)}}"
+            "@keyframes dl-fadein{from{opacity:0;transform:translateY(10px)}to{opacity:1;transform:translateY(0)}}"
+            "</style>"
+        ),
+        rx.box(
+            style={
+                "width": "72px",
+                "height": "72px",
+                "border": "5px solid #e2e8f0",
+                "border-top-color": "#667eea",
+                "border-radius": "50%",
+                "animation": "dl-spin 1s linear infinite",
+                "margin": "0 auto",
+            },
+        ),
+        rx.vstack(
+            rx.heading("Анализируем диаграмму", size="5", color="#1a202c"),
+            rx.text(
+                f"Модель: {State.model_label}",
+                font_size="0.85em",
+                color="#718096",
+            ),
+            spacing="1",
+            align="center",
+        ),
         rx.divider(),
         rx.vstack(
             rx.hstack(
-                rx.icon("check-circle-2", color="#38a169", size=20),
+                rx.text(
+                    "✓",
+                    color="#38a169",
+                    font_weight="700",
+                    font_size="1.1em",
+                    min_width="1.8em",
+                ),
                 rx.text("Изображение загружено", font_size="0.95em", color="#2d3748"),
-                align="center", width="100%",
+                align="center",
+                width="100%",
+                style={
+                    "animation": "dl-fadein 0.5s ease 0.3s forwards",
+                    "opacity": "0",
+                },
             ),
             rx.hstack(
                 rx.spinner(size="1", color="#667eea"),
                 rx.text("Отправляем в модель...", font_size="0.95em", color="#2d3748"),
-                spacing="3", align="center", width="100%",
+                spacing="3",
+                align="center",
+                width="100%",
+                style={
+                    "animation": "dl-fadein 0.5s ease 1.5s forwards",
+                    "opacity": "0",
+                },
             ),
-            spacing="3", align="start", width="100%", padding_x="1em",
+            rx.hstack(
+                rx.spinner(size="1", color="#667eea"),
+                rx.text(
+                    "Распознаём элементы диаграммы...",
+                    font_size="0.95em",
+                    color="#2d3748",
+                ),
+                spacing="3",
+                align="center",
+                width="100%",
+                style={
+                    "animation": "dl-fadein 0.5s ease 5.0s forwards",
+                    "opacity": "0",
+                },
+            ),
+            rx.hstack(
+                rx.spinner(size="1", color="#667eea"),
+                rx.text(
+                    "Анализируем связи и безопасность...",
+                    font_size="0.95em",
+                    color="#2d3748",
+                ),
+                spacing="3",
+                align="center",
+                width="100%",
+                style={
+                    "animation": "dl-fadein 0.5s ease 10.0s forwards",
+                    "opacity": "0",
+                },
+            ),
+            spacing="3",
+            align="start",
+            width="100%",
+            padding_x="0.5em",
+        ),
+        rx.cond(
+            State.retry_message,
+            rx.hstack(
+                rx.spinner(size="1", color="#e07b00"),
+                rx.text(
+                    State.retry_message,
+                    font_size="0.85em",
+                    color="#e07b00",
+                    font_weight="500",
+                ),
+                spacing="2",
+                align="center",
+                bg="#fffbeb",
+                border="1px solid #fcd34d",
+                border_radius="8px",
+                padding_x="1em",
+                padding_y="0.6em",
+                width="100%",
+            ),
         ),
         rx.cond(
             State.progress_message,
             rx.hstack(
                 rx.spinner(size="1", color="#667eea"),
-                rx.text(State.progress_message, font_size="0.85em", color="#4a5568", font_weight="500"),
-                spacing="2", align="center", bg="#edf2ff", border="1px solid #c3dafe",
-                border_radius="8px", padding_x="1em", padding_y="0.6em", width="100%",
+                rx.text(
+                    State.progress_message,
+                    font_size="0.85em",
+                    color="#4a5568",
+                    font_weight="500",
+                ),
+                spacing="2",
+                align="center",
+                bg="#edf2ff",
+                border="1px solid #c3dafe",
+                border_radius="8px",
+                padding_x="1em",
+                padding_y="0.6em",
+                width="100%",
             ),
         ),
         rx.button(
             rx.hstack(rx.icon("x", size=16), rx.text("Отменить"), spacing="2"),
             on_click=State.cancel_analysis,
-            variant="outline", color_scheme="gray", size="2",
+            variant="outline",
+            color_scheme="gray",
+            size="2",
         ),
-        spacing="5", align="center", width="100%", min_height="360px", justify="center",
+        spacing="5",
+        align="center",
+        width="100%",
+        min_height="360px",
+        justify="center",
     )
 
 
@@ -578,86 +724,175 @@ def index() -> rx.Component:
                 rx.vstack(
                     rx.heading(
                         "Анализ BPMN-диаграмм с помощью ИИ",
-                        size="8", text_align="center", font_weight="bold",
-                        color="white", text_shadow="0 2px 4px rgba(0,0,0,0.2)",
+                        size="8",
+                        text_align="center",
+                        font_weight="bold",
+                        color="white",
+                        text_shadow="0 2px 4px rgba(0,0,0,0.2)",
                     ),
                     rx.text(
                         "Загрузите диаграмму — получите пошаговое описание всех элементов",
-                        font_size="1.2em", text_align="center", color="#e2e8f0",
+                        font_size="1.2em",
+                        text_align="center",
+                        color="#e2e8f0",
                     ),
-                    spacing="3", align="center", width="100%", padding_bottom="2em",
+                    spacing="3",
+                    align="center",
+                    width="100%",
+                    padding_bottom="2em",
                 ),
                 rx.card(
-                    # Окно загрузки (скрыто, пока не начата загрузка)
-                    rx.box(
+                    rx.cond(
+                        State.is_uploading,
                         loading_content(),
-                        display=rx.cond(State.is_uploading, "block", "none"),
-                        width="100%",
-                    ),
-                    # Форма выбора файла (скрыта во время загрузки)
-                    rx.box(
                         rx.vstack(
                             rx.hstack(
                                 rx.icon("upload", size=30, color="#667eea"),
-                                rx.heading("Загрузка диаграммы", size="5", color="#1a202c"),
-                                spacing="3", align="center",
+                                rx.heading(
+                                    "Загрузка диаграммы", size="5", color="#1a202c"
+                                ),
+                                spacing="3",
+                                align="center",
                             ),
-                            rx.text("Поддерживаемый формат: PNG", font_size="0.8em", color="#718096"),
+                            rx.text(
+                                "Поддерживаемый формат: PNG",
+                                font_size="0.8em",
+                                color="#718096",
+                            ),
                             rx.divider(),
                             model_selector(),
                             rx.divider(),
                             rx.upload(
                                 rx.vstack(
                                     rx.icon("image", size=40, color="#a0aec0"),
-                                    rx.text("Перетащите PNG-файл сюда или нажмите", font_size="0.9em", color="#4a5568"),
-                                    rx.cond(
-                                        rx.selected_files("diagramlit_upload"),
-                                        rx.foreach(
-                                            rx.selected_files("diagramlit_upload"),
-                                            lambda f: rx.badge(f"Файл: {f}", color_scheme="green", variant="soft", size="2")
-                                        ),
-                                        rx.text("Файл не выбран", font_size="0.8em", color="#a0aec0"),
+                                    rx.text(
+                                        "Перетащите PNG-файл сюда или",
+                                        font_size="0.9em",
+                                        color="#4a5568",
                                     ),
-                                    spacing="3", align="center",
+                                    rx.button(
+                                        "Выбрать файл",
+                                        color_scheme="blue",
+                                        size="3",
+                                        variant="solid",
+                                    ),
+                                    rx.cond(
+                                        State.uploaded_filename,
+                                        rx.badge(
+                                            f"Файл: {State.uploaded_filename}",
+                                            color_scheme="green",
+                                            variant="soft",
+                                            font_size="0.8em",
+                                        ),
+                                    ),
+                                    spacing="3",
+                                    align="center",
                                 ),
-                                id="diagramlit_upload", multiple=False, accept={"image/png": [".png"]},
-                                border="2px dashed #cbd5e0", border_radius="12px", padding="2.5em", bg="#fafafa",
+                                on_drop=State.handle_upload(
+                                    rx.upload_files(upload_id="diagramlit_upload")
+                                ),
+                                id="diagramlit_upload",
+                                multiple=False,
+                                accept={"image/png": [".png"]},
+                                border="2px dashed #cbd5e0",
+                                border_radius="12px",
+                                padding="2.5em",
+                                bg="#fafafa",
                             ),
                             rx.cond(
-                                rx.selected_files("diagramlit_upload"),
-                                rx.hstack(
-                                    rx.button(
-                                        rx.hstack(rx.icon("play", size=16), rx.text("Начать анализ")),
-                                        on_click=State.handle_upload(rx.upload_files(upload_id="diagramlit_upload")),
-                                        color_scheme="blue", variant="solid", size="3", width="100%"
+                                State.uploaded_filename,
+                                rx.button(
+                                    rx.hstack(
+                                        rx.icon("trash-2", size=16),
+                                        rx.text("Очистить"),
                                     ),
-                                    rx.button(
-                                        rx.icon("trash-2", size=18),
-                                        on_click=rx.clear_selected_files("diagramlit_upload"),
-                                        color_scheme="red", variant="outline", size="3",
-                                    ),
-                                    spacing="3", width="100%",
-                                )
+                                    on_click=State.clear_upload,
+                                    color_scheme="red",
+                                    variant="outline",
+                                    size="2",
+                                ),
                             ),
-                            spacing="5", align="stretch", width="100%",
+                            spacing="5",
+                            align="stretch",
+                            width="100%",
                         ),
-                        display=rx.cond(State.is_uploading, "none", "block"),
-                        width="100%",
                     ),
-                    padding="2em", box_shadow="0 10px 15px -3px rgba(0, 0, 0, 0.1)",
-                    border_radius="16px", bg="white", min_height="380px",
+                    padding="2em",
+                    box_shadow="0 10px 15px -3px rgba(0, 0, 0, 0.1)",
+                    border_radius="16px",
+                    bg="white",
+                    min_height="380px",
                 ),
                 rx.grid(
-                    rx.card(rx.vstack(rx.icon("brain", size=32, color="#667eea"), rx.heading("ИИ-распознавание", size="4", color="#1a202c"), rx.text("Автоматическое определение элементов", text_align="center", font_size="0.9em", color="#4a5568"), spacing="3", align="center"), padding="1.5em", bg="white", border_radius="12px"),
-                    rx.card(rx.vstack(rx.icon("message-square", size=32, color="#667eea"), rx.heading("Пошаговое описание", size="4", color="#1a202c"), rx.text("Детальное объяснение всех процессов", text_align="center", font_size="0.9em", color="#4a5568"), spacing="3", align="center"), padding="1.5em", bg="white", border_radius="12px"),
-                    rx.card(rx.vstack(rx.icon("git-branch", size=32, color="#667eea"), rx.heading("Формат BPMN", size="4", color="#1a202c"), rx.text("Распознавание событий и шлюзов", text_align="center", font_size="0.9em", color="#4a5568"), spacing="3", align="center"), padding="1.5em", bg="white", border_radius="12px"),
-                    columns="repeat(3, 1fr)", gap="6", width="100%", padding_y="3em",
+                    rx.card(
+                        rx.vstack(
+                            rx.icon("brain", size=32, color="#667eea"),
+                            rx.heading("ИИ-распознавание", size="4", color="#1a202c"),
+                            rx.text(
+                                "Автоматическое определение элементов BPMN-диаграммы",
+                                text_align="center",
+                                font_size="0.9em",
+                                color="#4a5568",
+                            ),
+                            spacing="3",
+                            align="center",
+                        ),
+                        padding="1.5em",
+                        bg="white",
+                        border_radius="12px",
+                    ),
+                    rx.card(
+                        rx.vstack(
+                            rx.icon("message-square", size=32, color="#667eea"),
+                            rx.heading("Пошаговое описание", size="4", color="#1a202c"),
+                            rx.text(
+                                "Детальное объяснение всех процессов и связей",
+                                text_align="center",
+                                font_size="0.9em",
+                                color="#4a5568",
+                            ),
+                            spacing="3",
+                            align="center",
+                        ),
+                        padding="1.5em",
+                        bg="white",
+                        border_radius="12px",
+                    ),
+                    rx.card(
+                        rx.vstack(
+                            rx.icon("git-branch", size=32, color="#667eea"),
+                            rx.heading("Формат BPMN", size="4", color="#1a202c"),
+                            rx.text(
+                                "Распознавание событий, задач, шлюзов и потоков",
+                                text_align="center",
+                                font_size="0.9em",
+                                color="#4a5568",
+                            ),
+                            spacing="3",
+                            align="center",
+                        ),
+                        padding="1.5em",
+                        bg="white",
+                        border_radius="12px",
+                    ),
+                    columns="repeat(3, 1fr)",
+                    gap="6",
+                    width="100%",
+                    padding_y="3em",
                 ),
-                spacing="5", align="stretch", width="100%",
+                spacing="5",
+                align="stretch",
+                width="100%",
             ),
-            max_width="1200px", margin="0 auto", padding_x="2em", padding_y="3em", min_height="calc(100vh - 140px)",
+            max_width="1200px",
+            margin="0 auto",
+            padding_x="2em",
+            padding_y="3em",
+            min_height="calc(100vh - 140px)",
         ),
-        footer(), width="100%", min_height="100vh",
+        footer(),
+        width="100%",
+        min_height="100vh",
     )
 
 
@@ -665,42 +900,68 @@ def bbox_overlay(box: BBox) -> rx.Component:
     return rx.box(
         rx.box(
             rx.text(
-                box.label, font_size="0.65em", font_weight="900", color="#e53e3e", white_space="nowrap",
+                box.label,
+                font_size="0.65em",
+                font_weight="900",
+                color="#e53e3e",
+                white_space="nowrap",
                 text_shadow="1px 1px 0px rgba(255,255,255,0.9), -1px -1px 0px rgba(255,255,255,0.9), 1px -1px 0px rgba(255,255,255,0.9), -1px 1px 0px rgba(255,255,255,0.9)",
             ),
-            position="absolute", top="-1.3em", left="-2px", bg="transparent", padding="0",
+            position="absolute",
+            top="-1.3em",
+            left="-2px",
+            bg="transparent",
+            padding="0",
         ),
-        position="absolute", left=f"{box.x * 100}%", top=f"{box.y * 100}%", width=f"{box.w * 100}%", height=f"{box.h * 100}%",
-        border="2px solid #e53e3e", border_radius="3px", box_sizing="border-box", pointer_events="none",
+        position="absolute",
+        left=f"{box.x * 100}%",
+        top=f"{box.y * 100}%",
+        width=f"{box.w * 100}%",
+        height=f"{box.h * 100}%",
+        border="2px solid #e53e3e",
+        border_radius="3px",
+        box_sizing="border-box",
+        pointer_events="none",
     )
 
 
 def diagram_viewer() -> rx.Component:
     return rx.card(
         rx.vstack(
-            rx.hstack(rx.icon("scan-search", size=24, color="#667eea"), rx.heading("Распознанные элементы", size="4"), spacing="2", align="center"),
-            rx.text("Красные рамки — обнаруженные элементы диаграммы", font_size="0.85em", color="#718096"),
+            rx.hstack(
+                rx.icon("scan-search", size=24, color="#667eea"),
+                rx.heading("Распознанные элементы", size="4"),
+                spacing="2",
+                align="center",
+            ),
+            rx.text(
+                "Красные рамки — обнаруженные элементы диаграммы",
+                font_size="0.85em",
+                color="#718096",
+            ),
             rx.divider(),
             rx.box(
-                rx.image(src=State.image_path, width="100%", height="auto", display="block", border_radius="8px"),
+                rx.image(
+                    src=State.image_path,
+                    width="100%",
+                    height="auto",
+                    display="block",
+                    border_radius="8px",
+                ),
                 rx.foreach(State.bounding_boxes, bbox_overlay),
-                position="relative", width="100%", max_width="820px", margin="0 auto",
+                position="relative",
+                width="100%",
+                max_width="820px",
+                margin="0 auto",
             ),
-            spacing="3", width="100%", align="stretch",
+            spacing="3",
+            width="100%",
+            align="stretch",
         ),
-        width="100%", padding="1.5em", border_radius="12px", bg="white",
-    )
-
-
-def llm_pending_banner() -> rx.Component:
-    return rx.hstack(
-        rx.spinner(size="1", color="#667eea"),
-        rx.text(
-            rx.cond(State.progress_message, State.progress_message, "ИИ готовит описание…"),
-            font_size="0.9em", color="#4a5568", font_weight="500",
-        ),
-        spacing="2", align="center", bg="#edf2ff", border="1px solid #c3dafe",
-        border_radius="8px", padding_x="1em", padding_y="0.6em", width="100%",
+        width="100%",
+        padding="1.5em",
+        border_radius="12px",
+        bg="white",
     )
 
 
@@ -708,41 +969,105 @@ def steps_panel() -> rx.Component:
     return rx.card(
         rx.vstack(
             rx.hstack(
-                rx.hstack(rx.icon("list-checks", size=24, color="#667eea"), rx.heading("Пошаговое описание", size="4"), spacing="2", align="center"),
+                rx.hstack(
+                    rx.icon("list-checks", size=24, color="#667eea"),
+                    rx.heading("Пошаговое описание", size="4"),
+                    spacing="2",
+                    align="center",
+                ),
                 rx.spacer(),
                 rx.button(
-                    rx.hstack(rx.icon("copy", size=16), rx.text("Копировать"), spacing="2", align="center"),
-                    on_click=[rx.set_clipboard(State.steps_text), rx.toast.success("Текст скопирован в буфер обмена")],
-                    color_scheme="blue", variant="soft", size="2",
+                    rx.hstack(
+                        rx.icon("copy", size=16),
+                        rx.text("Копировать"),
+                        spacing="2",
+                        align="center",
+                    ),
+                    on_click=[
+                        rx.set_clipboard(State.steps_text),
+                        rx.toast.success("Текст скопирован в буфер обмена"),
+                    ],
+                    color_scheme="blue",
+                    variant="soft",
+                    size="2",
                 ),
-                width="100%", align="center",
+                width="100%",
+                align="center",
             ),
             rx.divider(),
-            rx.cond(State.llm_status == "pending", llm_pending_banner()),
+            rx.cond(
+                State.llm_status == "pending",
+                rx.hstack(
+                    rx.spinner(size="1", color="#667eea"),
+                    rx.text(
+                        rx.cond(State.progress_message, State.progress_message, "ИИ готовит описание…"),
+                        font_size="0.9em", color="#4a5568", font_weight="500",
+                    ),
+                    spacing="2", align="center", bg="#edf2ff", border="1px solid #c3dafe",
+                    border_radius="8px", padding_x="1em", padding_y="0.6em", width="100%",
+                )
+            ),
             rx.box(
                 rx.vstack(
                     rx.foreach(
                         State.step_by_step_description,
                         lambda step, idx: rx.hstack(
-                            rx.center(rx.text(idx + 1, font_size="0.8em", font_weight="700", color="white"), min_width="1.6em", height="1.6em", bg="#667eea", border_radius="50%", flex_shrink="0"),
-                            rx.text(step, font_size="0.95em", color="#2d3748", line_height="1.5"),
-                            spacing="3", align="start", width="100%",
+                            rx.center(
+                                rx.text(
+                                    idx + 1,
+                                    font_size="0.8em",
+                                    font_weight="700",
+                                    color="white",
+                                ),
+                                min_width="1.6em",
+                                height="1.6em",
+                                bg="#667eea",
+                                border_radius="50%",
+                                flex_shrink="0",
+                            ),
+                            rx.text(
+                                step,
+                                font_size="0.95em",
+                                color="#2d3748",
+                                line_height="1.5",
+                            ),
+                            spacing="3",
+                            align="start",
+                            width="100%",
                         ),
                     ),
-                    spacing="3", align="start", width="100%",
+                    spacing="3",
+                    align="start",
+                    width="100%",
                 ),
-                width="100%", max_height="420px", overflow_y="auto", padding="1.25em", bg="#f7fafc", border="1px solid #e2e8f0", border_radius="10px",
+                width="100%",
+                max_height="420px",
+                overflow_y="auto",
+                padding="1.25em",
+                bg="#f7fafc",
+                border="1px solid #e2e8f0",
+                border_radius="10px",
             ),
-            spacing="3", width="100%", align="stretch",
+            spacing="3",
+            width="100%",
+            align="stretch",
         ),
-        width="100%", padding="1.5em", border_radius="12px", bg="white",
+        width="100%",
+        padding="1.5em",
+        border_radius="12px",
+        bg="white",
     )
 
 
 def security_panel() -> rx.Component:
     return rx.card(
         rx.vstack(
-            rx.hstack(rx.icon("shield-alert", size=24, color="#e53e3e"), rx.heading("Проблемы безопасности", size="4"), spacing="2", align="center"),
+            rx.hstack(
+                rx.icon("shield-alert", size=24, color="#e53e3e"),
+                rx.heading("Проблемы безопасности", size="4"),
+                spacing="2",
+                align="center",
+            ),
             rx.divider(),
             rx.cond(
                 State.security_issues,
@@ -751,27 +1076,63 @@ def security_panel() -> rx.Component:
                         rx.foreach(
                             State.security_issues,
                             lambda issue: rx.hstack(
-                                rx.icon("triangle-alert", size=16, color="#e53e3e", flex_shrink="0", margin_top="2px"),
-                                rx.text(issue, font_size="0.9em", color="#2d3748", line_height="1.5"),
-                                spacing="3", align="start", width="100%",
+                                rx.icon(
+                                    "triangle-alert",
+                                    size=16,
+                                    color="#e53e3e",
+                                    flex_shrink="0",
+                                    margin_top="2px",
+                                ),
+                                rx.text(
+                                    issue,
+                                    font_size="0.9em",
+                                    color="#2d3748",
+                                    line_height="1.5",
+                                ),
+                                spacing="3",
+                                align="start",
+                                width="100%",
                             ),
                         ),
-                        spacing="3", align="start", width="100%",
+                        spacing="3",
+                        align="start",
+                        width="100%",
                     ),
-                    width="100%", max_height="420px", overflow_y="auto", padding="1.25em", bg="#fff5f5", border="1px solid #fed7d7", border_radius="10px",
+                    width="100%",
+                    max_height="420px",
+                    overflow_y="auto",
+                    padding="1.25em",
+                    bg="#fff5f5",
+                    border="1px solid #fed7d7",
+                    border_radius="10px",
                 ),
                 rx.center(
                     rx.vstack(
                         rx.icon("shield-check", size=40, color="#38a169"),
-                        rx.text("Уязвимостей не обнаружено", font_size="0.95em", font_weight="600", color="#38a169"),
-                        spacing="3", align="center",
+                        rx.text(
+                            "Уязвимостей не обнаружено",
+                            font_size="0.95em",
+                            font_weight="600",
+                            color="#38a169",
+                        ),
+                        spacing="3",
+                        align="center",
                     ),
-                    padding="2em", bg="#f0fff4", border="1px solid #c6f6d5", border_radius="10px", width="100%",
+                    padding="2em",
+                    bg="#f0fff4",
+                    border="1px solid #c6f6d5",
+                    border_radius="10px",
+                    width="100%",
                 ),
             ),
-            spacing="3", width="100%", align="stretch",
+            spacing="3",
+            width="100%",
+            align="stretch",
         ),
-        width="100%", padding="1.5em", border_radius="12px", bg="white",
+        width="100%",
+        padding="1.5em",
+        border_radius="12px",
+        bg="white",
     )
 
 
@@ -779,10 +1140,28 @@ def no_results_placeholder() -> rx.Component:
     return rx.center(
         rx.vstack(
             rx.icon("file-question", size=48, color="white"),
-            rx.text("Результатов анализа пока нет", color="white", font_size="1.2em", font_weight="600"),
-            rx.text("Загрузите диаграмму на главной странице", color="#e2e8f0", font_size="0.95em"),
-            rx.link(rx.button(rx.hstack(rx.icon("arrow-left", size=16), rx.text("На главную")), variant="solid", color_scheme="blue", size="3"), href="/"),
-            spacing="4", align="center",
+            rx.text(
+                "Результатов анализа пока нет",
+                color="white",
+                font_size="1.2em",
+                font_weight="600",
+            ),
+            rx.text(
+                "Загрузите диаграмму на главной странице",
+                color="#e2e8f0",
+                font_size="0.95em",
+            ),
+            rx.link(
+                rx.button(
+                    rx.hstack(rx.icon("arrow-left", size=16), rx.text("На главную")),
+                    variant="solid",
+                    color_scheme="blue",
+                    size="3",
+                ),
+                href="/",
+            ),
+            spacing="4",
+            align="center",
         ),
         min_height="60vh",
     )
@@ -796,9 +1175,20 @@ def results() -> rx.Component:
                 State.diagram_type,
                 rx.vstack(
                     rx.hstack(
-                        rx.link(rx.button(rx.hstack(rx.icon("arrow-left", size=16), rx.text("Назад")), variant="outline", bg="white"), href="/"),
+                        rx.link(
+                            rx.button(
+                                rx.hstack(
+                                    rx.icon("arrow-left", size=16), rx.text("Назад")
+                                ),
+                                variant="outline",
+                                bg="white",
+                            ),
+                            href="/",
+                        ),
                         rx.heading("Результаты анализа", size="7", color="white"),
-                        spacing="4", align="center", width="100%",
+                        spacing="4",
+                        align="center",
+                        width="100%",
                     ),
                     rx.divider(),
                     rx.cond(
@@ -806,10 +1196,30 @@ def results() -> rx.Component:
                         rx.card(
                             rx.hstack(
                                 rx.icon("circle-x", size=28, color="#e53e3e"),
-                                rx.vstack(rx.heading("Ошибка при обработке", size="4", color="#e53e3e"), rx.text(State.error_message, font_size="0.9em", color="#2d3748", word_break="break-word"), spacing="1", align="start"),
-                                spacing="4", align="start", width="100%",
+                                rx.vstack(
+                                    rx.heading(
+                                        "Ошибка при обработке",
+                                        size="4",
+                                        color="#e53e3e",
+                                    ),
+                                    rx.text(
+                                        State.error_message,
+                                        font_size="0.9em",
+                                        color="#2d3748",
+                                        word_break="break-word",
+                                    ),
+                                    spacing="1",
+                                    align="start",
+                                ),
+                                spacing="4",
+                                align="start",
+                                width="100%",
                             ),
-                            width="100%", padding="1.5em", border_radius="12px", bg="#fff5f5", border="1px solid #fed7d7",
+                            width="100%",
+                            padding="1.5em",
+                            border_radius="12px",
+                            bg="#fff5f5",
+                            border="1px solid #fed7d7",
                         ),
                     ),
                     rx.cond(
@@ -817,58 +1227,175 @@ def results() -> rx.Component:
                         rx.vstack(
                             rx.card(
                                 rx.vstack(
-                                    rx.hstack(rx.icon("bar-chart-2", size=24, color="#667eea"), rx.heading("Тип диаграммы", size="4"), spacing="2", align="center"),
-                                    rx.hstack(rx.badge(State.diagram_type, color_scheme="blue", variant="soft", size="3"), rx.text(f"Модель: {State.model_label}", font_size="0.8em", color="#718096"), spacing="3", align="center"),
+                                    rx.hstack(
+                                        rx.icon(
+                                            "bar-chart-2", size=24, color="#667eea"
+                                        ),
+                                        rx.heading("Тип диаграммы", size="4"),
+                                        spacing="2",
+                                        align="center",
+                                    ),
+                                    rx.hstack(
+                                        rx.badge(
+                                            State.diagram_type,
+                                            color_scheme="blue",
+                                            variant="soft",
+                                            size="3",
+                                        ),
+                                        rx.text(
+                                            f"Модель: {State.model_label}",
+                                            font_size="0.8em",
+                                            color="#718096",
+                                        ),
+                                        spacing="3",
+                                        align="center",
+                                    ),
                                 ),
-                                spacing="3", width="100%", padding="1.5em", border_radius="12px", bg="white",
+                                spacing="3",
+                                width="100%",
+                                padding="1.5em",
+                                border_radius="12px",
+                                bg="white",
                             ),
                             rx.cond(State.image_path, diagram_viewer()),
                             rx.cond(
                                 State.detected_elements,
                                 rx.card(
                                     rx.vstack(
-                                        rx.hstack(rx.icon("layout-grid", size=24, color="#667eea"), rx.heading("Список элементов", size="4"), spacing="2", align="center"),
-                                        rx.flex(rx.foreach(State.detected_elements, lambda el: rx.badge(el, color_scheme="green", variant="soft", size="2", padding_x="1em", padding_y="0.5em", border_radius="8px")), wrap="wrap", spacing="2", gap="2"),
+                                        rx.hstack(
+                                            rx.icon(
+                                                "layout-grid", size=24, color="#667eea"
+                                            ),
+                                            rx.heading("Список элементов", size="4"),
+                                            spacing="2",
+                                            align="center",
+                                        ),
+                                        rx.flex(
+                                            rx.foreach(
+                                                State.detected_elements,
+                                                lambda el: rx.badge(
+                                                    el,
+                                                    color_scheme="green",
+                                                    variant="soft",
+                                                    size="2",
+                                                    padding_x="1em",
+                                                    padding_y="0.5em",
+                                                    border_radius="8px",
+                                                ),
+                                            ),
+                                            wrap="wrap",
+                                            spacing="2",
+                                            gap="2",
+                                        ),
                                     ),
-                                    spacing="3", width="100%", padding="1.5em", border_radius="12px", bg="white",
+                                    spacing="3",
+                                    width="100%",
+                                    padding="1.5em",
+                                    border_radius="12px",
+                                    bg="white",
                                 ),
                             ),
                             rx.cond(
                                 State.relationships,
                                 rx.card(
                                     rx.vstack(
-                                        rx.hstack(rx.icon("share-2", size=24, color="#667eea"), rx.heading("Связи", size="4"), spacing="2", align="center"),
-                                        rx.vstack(rx.foreach(State.relationships, lambda rel: rx.hstack(rx.icon("link-2", size=14, color="#764ba2"), rx.text(rel, font_size="0.95em", color="#2d3748"), spacing="2", align="center")), spacing="2", align="start", width="100%"),
+                                        rx.hstack(
+                                            rx.icon(
+                                                "share-2", size=24, color="#667eea"
+                                            ),
+                                            rx.heading(
+                                                "Связи между элементами", size="4"
+                                            ),
+                                            spacing="2",
+                                            align="center",
+                                        ),
+                                        rx.vstack(
+                                            rx.foreach(
+                                                State.relationships,
+                                                lambda rel: rx.hstack(
+                                                    rx.icon(
+                                                        "link-2",
+                                                        size=14,
+                                                        color="#764ba2",
+                                                    ),
+                                                    rx.text(
+                                                        rel,
+                                                        font_size="0.95em",
+                                                        color="#2d3748",
+                                                    ),
+                                                    spacing="2",
+                                                    align="center",
+                                                ),
+                                            ),
+                                            spacing="2",
+                                            align="start",
+                                            width="100%",
+                                        ),
                                     ),
-                                    spacing="3", width="100%", padding="1.5em", border_radius="12px", bg="white",
+                                    spacing="3",
+                                    width="100%",
+                                    padding="1.5em",
+                                    border_radius="12px",
+                                    bg="white",
                                 ),
                             ),
                             rx.cond(
                                 State.step_by_step_description | (State.llm_status == "pending"),
-                                rx.grid(steps_panel(), security_panel(), columns="2", gap="6", width="100%"),
+                                rx.grid(
+                                    steps_panel(),
+                                    security_panel(),
+                                    columns="2",
+                                    gap="6",
+                                    width="100%",
+                                ),
                             ),
-                            spacing="6", align="stretch", width="100%",
+                            spacing="6",
+                            align="stretch",
+                            width="100%",
                         ),
                     ),
-                    spacing="4", align="stretch", width="100%",
+                    spacing="4",
+                    align="stretch",
+                    width="100%",
                 ),
                 rx.cond(
                     State.is_uploading,
                     rx.center(
                         rx.vstack(
-                            rx.hstack(rx.spinner(size="3", color="#667eea"), rx.text("Анализ ещё выполняется...", color="white", font_size="1.1em"), spacing="3", align="center"),
-                            rx.cond(State.progress_message, rx.text(State.progress_message, color="#e2e8f0", font_size="0.9em")),
-                            rx.button(rx.hstack(rx.icon("x", size=16), rx.text("Отменить")), on_click=State.cancel_analysis, variant="outline", bg="white", size="2"),
-                            spacing="4", align="center",
+                            rx.hstack(
+                                rx.spinner(size="3", color="#667eea"),
+                                rx.text(
+                                    "Анализ ещё выполняется...",
+                                    color="white",
+                                    font_size="1.1em",
+                                ),
+                                spacing="3",
+                                align="center",
+                            ),
+                            rx.button(
+                                rx.hstack(rx.icon("x", size=16), rx.text("Отменить")),
+                                on_click=State.cancel_analysis,
+                                variant="outline",
+                                bg="white",
+                                size="2",
+                            ),
+                            spacing="4",
+                            align="center",
                         ),
                         min_height="60vh",
                     ),
                     no_results_placeholder(),
                 ),
             ),
-            max_width="1400px", margin="0 auto", padding_x="2em", padding_y="3em", min_height="calc(100vh - 140px)",
+            max_width="1400px",
+            margin="0 auto",
+            padding_x="2em",
+            padding_y="3em",
+            min_height="calc(100vh - 140px)",
         ),
-        footer(), width="100%", min_height="100vh",
+        footer(),
+        width="100%",
+        min_height="100vh",
     )
 
 
