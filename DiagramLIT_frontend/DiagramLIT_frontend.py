@@ -140,6 +140,10 @@ async def _infer_gemini(image_bytes: bytes) -> Dict[str, Any]:
     }
     if GEMINI_BASE_URL:
         kwargs["base_url"] = GEMINI_BASE_URL
+    proxy_url = os.getenv("PROXY_URL", "").strip()
+
+    if proxy_url:
+        kwargs["http_client"] = httpx.AsyncClient(proxy=proxy_url)
 
     client = AsyncOpenAI(**kwargs)
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
