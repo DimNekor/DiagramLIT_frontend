@@ -1,6 +1,8 @@
 *.db
 .web
 assets/external/
+uploaded_files/
+assets/diagram_*
 *.py[cod]
 .states
 # Byte-compiled / optimized / DLL files
