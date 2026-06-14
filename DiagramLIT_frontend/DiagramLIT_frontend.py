@@ -6,6 +6,7 @@ import httpx
 import json
 import os
 import re
+import time
 import traceback
 from typing import Any, Dict, List
 
@@ -20,6 +21,13 @@ GEMINI_MODEL = os.getenv("GEMINI_MODEL", "gemini-3.1-pro-preview")
 
 LOCAL_VLM_URL = os.getenv("LOCAL_VLM_URL", "http://localhost:2023")
 ORANGEPI_URL = os.getenv("ORANGEPI_URL", "http://localhost:2022")
+
+# Таймаут на submit (CV: детекция + OCR — секунды/десятки секунд)
+ORANGEPI_CV_TIMEOUT = float(os.getenv("ORANGEPI_CV_TIMEOUT", 120.0))
+# Таймаут на один poll-запрос (лёгкий, должен отвечать мгновенно)
+ORANGEPI_POLL_TIMEOUT = float(os.getenv("ORANGEPI_POLL_TIMEOUT", 30.0))
+# Интервал опроса статуса LLM
+ORANGEPI_POLL_INTERVAL = float(os.getenv("ORANGEPI_POLL_INTERVAL", 2.0))
 
 BPMN_ANALYSIS_PROMPT = """
 Ты — эксперт по анализу BPMN-диаграмм и информационной безопасности.
@@ -179,30 +187,18 @@ async def _infer_local_vlm(image_bytes: bytes) -> Dict[str, Any]:
     )
 
 
-async def _infer_orangepi(image_bytes: bytes) -> Dict[str, Any]:
-    """Отправляет изображение на локальный FastAPI-бэкенд (OrangePi) через SSH-туннель."""
-
-    # 1. Формируем URL. Берем базовый адрес из .env (по умолчанию http://localhost:2022)
-    # и добавляем эндпоинт /infer, который прописан в FastAPI.
+async def _orangepi_submit(image_bytes: bytes) -> Dict[str, Any]:
+    """Сабмит на OrangePi: POST /infer. Возвращает CV-результат + job_id СРАЗУ.
+    Это быстрый запрос (только детекция и OCR), без ожидания LLM."""
     base_url = ORANGEPI_URL.rstrip("/")
     url = f"{base_url}/infer"
-
-    # 2. Подготавливаем файл для отправки (multipart/form-data).
-    # Ключ "file" должен строго совпадать с названием параметра в функции predict_diagram(file: UploadFile = File(...))
     files = {"file": ("diagram.png", image_bytes, "image/png")}
-
-    # 3. Отправляем асинхронный POST-запрос.
-    # Таймаут увеличен до 60 секунд, так как инференс нейросети занимает время.
-    async with httpx.AsyncClient(timeout=900.0) as client:
+    timeout = httpx.Timeout(ORANGEPI_CV_TIMEOUT, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
         try:
             response = await client.post(url, files=files)
-
-            # Если бэкенд вернул ошибку (например, 500 Internal Server Error), выбрасываем исключение
             response.raise_for_status()
-
-            # FastAPI автоматически сериализует ответ в JSON, просто парсим его
             return response.json()
-
         except httpx.ConnectError:
             raise RuntimeError(
                 f"Не удалось подключиться к OrangePi по адресу {url}. "
@@ -210,22 +206,30 @@ async def _infer_orangepi(image_bytes: bytes) -> Dict[str, Any]:
             )
         except httpx.TimeoutException:
             raise RuntimeError(
-                "Таймаут: OrangePi обрабатывает диаграмму слишком долго (более 60 секунд)."
+                f"Таймаут детекции: OrangePi не ответил за {int(ORANGEPI_CV_TIMEOUT)} секунд."
             )
         except httpx.HTTPStatusError as e:
             raise RuntimeError(
                 f"Ошибка на стороне FastAPI (код {e.response.status_code}): {e.response.text}"
             )
-        except Exception as e:
-            raise RuntimeError(
-                f"Непредвиденная ошибка при запросе к OrangePi: {str(e)}"
-            )
 
 
+async def _orangepi_poll(job_id: str) -> Dict[str, Any]:
+    """Опрос статуса джобы: GET /infer/{job_id}. Лёгкий короткий запрос."""
+    base_url = ORANGEPI_URL.rstrip("/")
+    url = f"{base_url}/infer/{job_id}"
+    timeout = httpx.Timeout(ORANGEPI_POLL_TIMEOUT, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.get(url)
+        response.raise_for_status()
+        return response.json()
+
+
+# Только синхронные «один ответ целиком» модели. OrangePi обрабатывается
+# отдельной веткой (submit + poll), поэтому его здесь нет.
 INFER_FUNCS = {
     "gemini": _infer_gemini,
     "local_vlm": _infer_local_vlm,
-    "orangepi": _infer_orangepi,
 }
 
 
@@ -234,7 +238,13 @@ class State(rx.State):
 
     is_uploading: bool = False
     retry_message: str = ""
+    progress_message: str = ""
     cancel_requested: bool = False
+
+    # Статус фоновой генерации описания на OrangePi:
+    # "" (не используется) / "pending" / "done" / "error"
+    llm_status: str = ""
+    llm_job_id: str = ""
 
     selected_model: str = "gemini"
     image_data_url: str = ""
@@ -274,14 +284,41 @@ class State(rx.State):
         self.security_issues = []
         self.error_message = ""
         self.retry_message = ""
+        self.progress_message = ""
+        self.llm_status = ""
+        self.llm_job_id = ""
         self.image_data_url = ""
         self.cancel_requested = False
+
+    def _apply_cv_result(self, result: Dict[str, Any]):
+        """Раскладывает результат (CV или полный) по полям состояния.
+        Вызывать ТОЛЬКО внутри `async with self` (мутирует state)."""
+        self.diagram_type = result.get("diagram_type", "Неизвестный тип")
+        self.detected_elements = result.get("detected_elements", [])
+        self.relationships = result.get("relationships", [])
+        self.step_by_step_description = result.get("step_by_step_description", [])
+        self.security_issues = result.get("security_issues", [])
+
+        boxes: List[BBox] = []
+        for b in result.get("bounding_boxes", []):
+            try:
+                boxes.append(
+                    BBox(
+                        label=str(b.get("label", "")),
+                        x=float(b.get("x", 0)),
+                        y=float(b.get("y", 0)),
+                        w=float(b.get("w", 0)),
+                        h=float(b.get("h", 0)),
+                    )
+                )
+            except Exception:
+                pass
+        self.bounding_boxes = boxes
 
     # ── Шаг 1. Быстрый обработчик загрузки: только принять файл ──────────
     async def handle_upload(self, files: List[rx.UploadFile]):
         """Включает спиннер, читает файл и СРАЗУ завершается, передавая
-        тяжёлую работу фоновой задаче run_analysis. Никакого инференса здесь!
-        Обработчик быстрый, поэтому спиннер появляется почти мгновенно."""
+        тяжёлую работу фоновой задаче run_analysis. Никакого инференса здесь!"""
         if not files:
             self.is_uploading = False
             return
@@ -293,15 +330,35 @@ class State(rx.State):
         self.image_data_url = (
             "data:image/png;base64," + base64.b64encode(file_content).decode()
         )
-        # Цепляем фоновую задачу — она не блокирует state и шлёт
-        # обновления по websocket, поэтому спиннер и ретраи видны всегда.
         yield State.run_analysis
+
+    # ── Инференс одной попытки с heartbeat (держит websocket живым) ──────
+    async def _infer_with_heartbeat(self, infer, image_bytes: bytes) -> Dict[str, Any]:
+        """Запускает infer(image_bytes) задачей и каждые несколько секунд
+        обновляет state — этот трафик по websocket не даёт соединению уснуть
+        на долгих запросах. Возвращает результат или пробрасывает исключение."""
+        task = asyncio.create_task(infer(image_bytes))
+        start = time.monotonic()
+        try:
+            while not task.done():
+                await asyncio.wait({task}, timeout=5.0)
+                async with self:
+                    if self.cancel_requested:
+                        task.cancel()
+                        raise asyncio.CancelledError()
+                    elapsed = int(time.monotonic() - start)
+                    self.progress_message = f"Идёт обработка на устройстве… {elapsed // 60}:{elapsed % 60:02d}"
+        except asyncio.CancelledError:
+            if not task.done():
+                task.cancel()
+            raise
+        return task.result()
 
     # ── Шаг 2. Тяжёлый инференс в фоне ────────────────────────────────────
     @rx.event(background=True)
     async def run_analysis(self):
-        """Фоновая задача: не держит блокировку состояния, поэтому UI
-        остаётся живым (включая кнопку «Отменить»)."""
+        """Фоновая задача. Для OrangePi: submit (CV сразу) → redirect →
+        poll (описание подъезжает). Для облачных моделей: один ответ целиком."""
         try:
             async with self:
                 if not self.image_data_url:
@@ -310,73 +367,153 @@ class State(rx.State):
                 image_bytes = base64.b64decode(self.image_data_url.split(",", 1)[1])
                 model_key = self.selected_model
 
-            infer = INFER_FUNCS.get(model_key)
-            result: Dict[str, Any] | None = None
-            error: Exception | None = None
-
-            for attempt in range(3):
+            # ============ OrangePi: submit (CV) + poll (LLM) ============
+            if model_key == "orangepi":
+                # 1) Сабмит — быстрый POST. CV-результат и job_id приходят сразу.
+                #    Оборачиваем в heartbeat: OCR может занять десятки секунд.
                 try:
-                    if infer is None:
-                        result = _demo_result("Неизвестная модель")
-                    else:
-                        result = await infer(image_bytes)
-                    error = None
-                    break
-                except Exception as e:
-                    error = e
-                    if "429" not in str(e) or attempt >= 2:
-                        break
-                    wait = 35
-                    async with self:
-                        if self.cancel_requested:
-                            return
-                        self.retry_message = (
-                            f"Лимит запросов API. "
-                            f"Повтор {attempt + 1}/2 через {wait} сек..."
-                        )
-                    await asyncio.sleep(wait)
-                    async with self:
-                        self.retry_message = ""
-                        if self.cancel_requested:
-                            return
-
-            cancelled = False
-            async with self:
-                cancelled = self.cancel_requested
-                self.is_uploading = False
-                self.retry_message = ""
-                if cancelled:
-                    return
-                if error is not None or result is None:
-                    self.error_message = str(error) if error else "Неизвестная ошибка"
-                    self.diagram_type = "Ошибка"
-                    print(f"[DiagramLIT] Ошибка: {error}")
-                else:
-                    self.diagram_type = result.get("diagram_type", "Неизвестный тип")
-                    self.detected_elements = result.get("detected_elements", [])
-                    self.relationships = result.get("relationships", [])
-                    self.step_by_step_description = result.get(
-                        "step_by_step_description", []
+                    submit = await self._infer_with_heartbeat(
+                        _orangepi_submit, image_bytes
                     )
-                    self.security_issues = result.get("security_issues", [])
+                except asyncio.CancelledError:
+                    async with self:
+                        self.is_uploading = False
+                        self.retry_message = ""
+                        self.progress_message = ""
+                    return
+                except Exception as e:
+                    async with self:
+                        self.is_uploading = False
+                        self.retry_message = ""
+                        self.progress_message = ""
+                        self.error_message = str(e)
+                        self.diagram_type = "Ошибка"
+                    yield rx.redirect("/results")
+                    return
 
-                    boxes: List[BBox] = []
-                    for b in result.get("bounding_boxes", []):
-                        try:
-                            boxes.append(
-                                BBox(
-                                    label=str(b.get("label", "")),
-                                    x=float(b.get("x", 0)),
-                                    y=float(b.get("y", 0)),
-                                    w=float(b.get("w", 0)),
-                                    h=float(b.get("h", 0)),
-                                )
+                # Бэкенд при провале детекции возвращает diagram_type="Ошибка"
+                if submit.get("diagram_type") == "Ошибка":
+                    async with self:
+                        self.is_uploading = False
+                        self.progress_message = ""
+                        self.error_message = submit.get(
+                            "error_message", "Ошибка детекции"
+                        )
+                        self.diagram_type = "Ошибка"
+                    yield rx.redirect("/results")
+                    return
+
+                job_id = submit.get("job_id", "")
+                async with self:
+                    if self.cancel_requested:
+                        self.is_uploading = False
+                        self.progress_message = ""
+                        return
+                    self._apply_cv_result(submit)
+                    self.llm_job_id = job_id
+                    self.llm_status = "pending" if job_id else "done"
+                    self.progress_message = "ИИ готовит описание…" if job_id else ""
+                    self.is_uploading = False
+                # CV готов — показываем результаты немедленно
+                yield rx.redirect("/results")
+
+                if not job_id:
+                    return
+
+                # 2) Поллинг — короткие GET-запросы, пока описание не готово.
+                start = time.monotonic()
+                while True:
+                    await asyncio.sleep(ORANGEPI_POLL_INTERVAL)
+                    async with self:
+                        if self.cancel_requested:
+                            self.llm_status = ""
+                            self.progress_message = ""
+                            return
+                    try:
+                        poll = await _orangepi_poll(job_id)
+                    except Exception:
+                        # сеть/туннель моргнули — повторим на следующей итерации
+                        continue
+
+                    status = poll.get("status", "pending")
+                    if status in ("done", "error"):
+                        async with self:
+                            self.step_by_step_description = poll.get(
+                                "step_by_step_description",
+                                self.step_by_step_description,
                             )
-                        except Exception:
-                            pass
-                    self.bounding_boxes = boxes
+                            self.llm_status = status
+                            self.progress_message = ""
+                        return
 
-            yield rx.redirect("/results")
+                    elapsed = int(time.monotonic() - start)
+                    async with self:
+                        self.progress_message = (
+                            f"ИИ готовит описание… {elapsed // 60}:{elapsed % 60:02d}"
+                        )
+
+            # ============ Облачные/прочие модели: один ответ целиком ============
+            else:
+                infer = INFER_FUNCS.get(model_key)
+                result: Dict[str, Any] | None = None
+                error: Exception | None = None
+
+                for attempt in range(3):
+                    try:
+                        if infer is None:
+                            result = _demo_result("Неизвестная модель")
+                        else:
+                            result = await self._infer_with_heartbeat(
+                                infer, image_bytes
+                            )
+                        error = None
+                        break
+                    except asyncio.CancelledError:
+                        async with self:
+                            self.is_uploading = False
+                            self.retry_message = ""
+                            self.progress_message = ""
+                        return
+                    except Exception as e:
+                        error = e
+                        if "429" not in str(e) or attempt >= 2:
+                            break
+                        wait = 35
+                        async with self:
+                            if self.cancel_requested:
+                                return
+                            self.progress_message = ""
+                            self.retry_message = (
+                                f"Лимит запросов API. "
+                                f"Повтор {attempt + 1}/2 через {wait} сек..."
+                            )
+                        await asyncio.sleep(wait)
+                        async with self:
+                            self.retry_message = ""
+                            if self.cancel_requested:
+                                return
+
+                async with self:
+                    if self.cancel_requested:
+                        self.is_uploading = False
+                        self.retry_message = ""
+                        self.progress_message = ""
+                        return
+                    self.is_uploading = False
+                    self.retry_message = ""
+                    self.progress_message = ""
+                    if error is not None or result is None:
+                        self.error_message = (
+                            str(error) if error else "Неизвестная ошибка"
+                        )
+                        self.diagram_type = "Ошибка"
+                        print(f"[DiagramLIT] Ошибка: {error}")
+                    else:
+                        self._apply_cv_result(result)
+                        self.llm_status = (
+                            ""  # для облачных моделей отдельной LLM-фазы нет
+                        )
+                yield rx.redirect("/results")
 
         except Exception as e:
             # Страховка: что бы ни случилось, спиннер НЕ зависнет.
@@ -384,17 +521,20 @@ class State(rx.State):
             async with self:
                 self.is_uploading = False
                 self.retry_message = ""
+                self.progress_message = ""
                 self.error_message = str(e)
                 self.diagram_type = "Ошибка"
             yield rx.redirect("/results")
 
     # ── Аварийный выход из спиннера ───────────────────────────────────────
     def cancel_analysis(self):
-        """Кнопка «Отменить» на спиннере: мгновенно возвращает форму,
-        а фоновая задача увидит флаг и тихо завершится без redirect."""
+        """Кнопка «Отменить»: мгновенно возвращает форму, а фоновая задача
+        увидит флаг и тихо завершится без redirect."""
         self.cancel_requested = True
         self.is_uploading = False
         self.retry_message = ""
+        self.progress_message = ""
+        self.llm_status = ""
 
     def clear_upload(self):
         self.uploaded_filename = ""
@@ -559,25 +699,31 @@ def loading_content() -> rx.Component:
                     "opacity": "0",
                 },
             ),
-            rx.hstack(
-                rx.spinner(size="1", color="#667eea"),
-                rx.text(
-                    "Анализируем связи и безопасность...",
-                    font_size="0.95em",
-                    color="#2d3748",
-                ),
-                spacing="3",
-                align="center",
-                width="100%",
-                style={
-                    "animation": "dl-fadein 0.5s ease 10.0s forwards",
-                    "opacity": "0",
-                },
-            ),
             spacing="3",
             align="start",
             width="100%",
             padding_x="0.5em",
+        ),
+        # Живой таймер обработки (heartbeat) — виден на долгом submit.
+        rx.cond(
+            State.progress_message,
+            rx.hstack(
+                rx.spinner(size="1", color="#667eea"),
+                rx.text(
+                    State.progress_message,
+                    font_size="0.85em",
+                    color="#4a5568",
+                    font_weight="500",
+                ),
+                spacing="2",
+                align="center",
+                bg="#edf2ff",
+                border="1px solid #c3dafe",
+                border_radius="8px",
+                padding_x="1em",
+                padding_y="0.6em",
+                width="100%",
+            ),
         ),
         rx.cond(
             State.retry_message,
@@ -686,8 +832,6 @@ def index() -> rx.Component:
                                     spacing="3",
                                     align="center",
                                 ),
-                                # handle_upload быстрый: включает спиннер,
-                                # сохраняет файл и уходит в фоновую задачу.
                                 on_drop=State.handle_upload(
                                     rx.upload_files(upload_id="diagramlit_upload")
                                 ),
@@ -799,7 +943,6 @@ def index() -> rx.Component:
 def bbox_overlay(box: BBox) -> rx.Component:
     """Красная рамка + прозрачный текст с белой обводкой и уменьшенным шрифтом."""
     return rx.box(
-        # Внутренний контейнер для текста
         rx.box(
             rx.text(
                 box.label,
@@ -868,6 +1011,31 @@ def diagram_viewer() -> rx.Component:
     )
 
 
+def llm_pending_banner() -> rx.Component:
+    """Спиннер-таймер в блоке описания, пока LLM на устройстве ещё считает."""
+    return rx.hstack(
+        rx.spinner(size="1", color="#667eea"),
+        rx.text(
+            rx.cond(
+                State.progress_message,
+                State.progress_message,
+                "ИИ готовит описание…",
+            ),
+            font_size="0.9em",
+            color="#4a5568",
+            font_weight="500",
+        ),
+        spacing="2",
+        align="center",
+        bg="#edf2ff",
+        border="1px solid #c3dafe",
+        border_radius="8px",
+        padding_x="1em",
+        padding_y="0.6em",
+        width="100%",
+    )
+
+
 def steps_panel() -> rx.Component:
     """Окно с текстом всех шагов + кнопка копирования."""
     return rx.card(
@@ -899,6 +1067,11 @@ def steps_panel() -> rx.Component:
                 align="center",
             ),
             rx.divider(),
+            # Пока описание готовится на устройстве — спиннер-таймер сверху.
+            rx.cond(
+                State.llm_status == "pending",
+                llm_pending_banner(),
+            ),
             rx.box(
                 rx.vstack(
                     rx.foreach(
@@ -1068,7 +1241,6 @@ def results() -> rx.Component:
             rx.cond(
                 State.diagram_type,
                 rx.vstack(
-                    # ── Заголовок ──────────────────────────────────────────
                     rx.hstack(
                         rx.link(
                             rx.button(
@@ -1086,7 +1258,6 @@ def results() -> rx.Component:
                         width="100%",
                     ),
                     rx.divider(),
-                    # ── Баннер ошибки ──────────────────────────────────────
                     rx.cond(
                         State.has_error,
                         rx.card(
@@ -1118,7 +1289,6 @@ def results() -> rx.Component:
                             border="1px solid #fed7d7",
                         ),
                     ),
-                    # ── Основной контент (только без ошибки) ───────────────
                     rx.cond(
                         ~State.has_error,
                         rx.vstack(
@@ -1236,8 +1406,10 @@ def results() -> rx.Component:
                                     bg="white",
                                 ),
                             ),
+                            # Блок описания: показываем, если есть шаги ИЛИ ещё идёт генерация
                             rx.cond(
-                                State.step_by_step_description,
+                                State.step_by_step_description
+                                | (State.llm_status == "pending"),
                                 rx.grid(
                                     steps_panel(),
                                     security_panel(),
@@ -1255,7 +1427,6 @@ def results() -> rx.Component:
                     align="stretch",
                     width="100%",
                 ),
-                # ── diagram_type пуст: либо анализ ещё идёт, либо его нет ──
                 rx.cond(
                     State.is_uploading,
                     rx.center(
@@ -1269,6 +1440,14 @@ def results() -> rx.Component:
                                 ),
                                 spacing="3",
                                 align="center",
+                            ),
+                            rx.cond(
+                                State.progress_message,
+                                rx.text(
+                                    State.progress_message,
+                                    color="#e2e8f0",
+                                    font_size="0.9em",
+                                ),
                             ),
                             rx.button(
                                 rx.hstack(rx.icon("x", size=16), rx.text("Отменить")),
