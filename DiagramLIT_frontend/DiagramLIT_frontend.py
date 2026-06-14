@@ -95,7 +95,6 @@ BPMN_ANALYSIS_PROMPT = '''
 
 def _parse_model_json(text: str) -> Dict[str, Any]:
     text = text.strip()
-    # ИСПОЛЬЗУЕМ HEX-КОД СИМВОЛА \x60 ВМЕСТО САМИХ КАВЫЧЕК
     text = re.sub(r"^\x60{3}(?:json)?\s*", "", text)
     text = re.sub(r"\s*\x60{3}$", "", text.strip())
     text = text.strip()
@@ -135,9 +134,17 @@ def _demo_result(diagram_type: str = "BPMN Process Diagram") -> Dict[str, Any]:
 
 
 async def _infer_gemini(image_bytes: bytes) -> Dict[str, Any]:
-    client = AsyncOpenAI(base_url=GEMINI_BASE_URL, api_key=GEMINI_API_KEY)
+    kwargs = {
+        "api_key": GEMINI_API_KEY,
+        "timeout": 120.0,
+    }
+    if GEMINI_BASE_URL:
+        kwargs["base_url"] = GEMINI_BASE_URL
+
+    client = AsyncOpenAI(**kwargs)
     image_b64 = base64.b64encode(image_bytes).decode("utf-8")
-    stream = await client.chat.completions.create(
+    
+    response = await client.chat.completions.create(
         model=GEMINI_MODEL,
         messages=[
             {
@@ -151,18 +158,14 @@ async def _infer_gemini(image_bytes: bytes) -> Dict[str, Any]:
                 ],
             }
         ],
-        stream=True,
+        stream=False,
     )
-    text = ""
-    async for chunk in stream:
-        delta = chunk.choices[0].delta.content
-        if delta:
-            text += delta
-    stripped = text.strip()
-    if not stripped.startswith("{"):
-        if "429" in stripped:
-            raise RuntimeError("Превышен лимит запросов к Gemini API (429). Подождите 30–60 секунд и попробуйте снова.")
-        raise RuntimeError(f"Неожиданный ответ от API: {stripped[:200]}")
+    
+    text = response.choices[0].message.content or ""
+    
+    if "429" in text:
+        raise RuntimeError("Превышен лимит запросов к Gemini API (429). Подождите 30–60 секунд и попробуйте снова.")
+        
     return _parse_model_json(text)
 
 
@@ -214,7 +217,6 @@ class State(rx.State):
     llm_job_id: str = ""
 
     selected_model: str = "gemini"
-    # Сохраняем ТОЛЬКО путь к файлу для обхода ошибки WebSockets
     image_path: str = ""
     uploaded_filename: str = ""
     
@@ -237,6 +239,19 @@ class State(rx.State):
     @rx.var
     def steps_text(self) -> str:
         return "\n".join(f"{i + 1}. {s}" for i, s in enumerate(self.step_by_step_description))
+
+    # Безопасные вычисляемые свойства для условного рендеринга на фронтенде
+    @rx.var
+    def show_steps_panel(self) -> bool:
+        return len(self.step_by_step_description) > 0 or self.llm_status == "pending"
+
+    @rx.var
+    def has_detected_elements(self) -> bool:
+        return len(self.detected_elements) > 0
+
+    @rx.var
+    def has_relationships(self) -> bool:
+        return len(self.relationships) > 0
 
     def set_selected_model(self, value: str):
         self.selected_model = value
@@ -285,17 +300,19 @@ class State(rx.State):
         self._reset_results()
         self.is_uploading = True
         self.uploaded_filename = files[0].filename
-        yield  # Отправляем триггер для красивого UI спиннера до чтения
+        yield
         
         file_content = await files[0].read()
         
         safe_filename = f"diagram_{uuid.uuid4().hex[:8]}.png"
-        os.makedirs("assets", exist_ok=True)
-        file_path = os.path.join("assets", safe_filename)
+        upload_dir = rx.get_upload_dir()
+        os.makedirs(upload_dir, exist_ok=True)
+        file_path = os.path.join(upload_dir, safe_filename)
+        
         with open(file_path, "wb") as f:
             f.write(file_content)
             
-        self.image_path = f"/{safe_filename}"
+        self.image_path = safe_filename
         yield State.run_analysis
 
     async def _infer_with_heartbeat(self, infer, image_bytes: bytes) -> Dict[str, Any]:
@@ -309,7 +326,6 @@ class State(rx.State):
                         task.cancel()
                         raise asyncio.CancelledError()
                     elapsed = int(time.monotonic() - start)
-                    # Выводим сообщение только если долго думает, чтобы не сбивать красивую CSS анимацию
                     if elapsed > 15:
                         self.progress_message = f"Ожидание ответа от ИИ… {elapsed // 60}:{elapsed % 60:02d}"
         except asyncio.CancelledError:
@@ -327,7 +343,7 @@ class State(rx.State):
                     return
                 model_key = self.selected_model
                 
-            local_path = os.path.join("assets", self.image_path.lstrip("/"))
+            local_path = os.path.join(rx.get_upload_dir(), self.image_path)
             try:
                 with open(local_path, "rb") as f:
                     image_bytes = f.read()
@@ -568,7 +584,6 @@ def model_selector() -> rx.Component:
 
 
 def loading_content() -> rx.Component:
-    """Точная копия вашей красивой CSS анимации"""
     return rx.vstack(
         rx.html(
             "<style>"
@@ -942,7 +957,7 @@ def diagram_viewer() -> rx.Component:
             rx.divider(),
             rx.box(
                 rx.image(
-                    src=State.image_path,
+                    src=rx.get_upload_url(State.image_path),
                     width="100%",
                     height="auto",
                     display="block",
@@ -1259,7 +1274,7 @@ def results() -> rx.Component:
                             ),
                             rx.cond(State.image_path, diagram_viewer()),
                             rx.cond(
-                                State.detected_elements,
+                                State.has_detected_elements,
                                 rx.card(
                                     rx.vstack(
                                         rx.hstack(
@@ -1296,7 +1311,7 @@ def results() -> rx.Component:
                                 ),
                             ),
                             rx.cond(
-                                State.relationships,
+                                State.has_relationships,
                                 rx.card(
                                     rx.vstack(
                                         rx.hstack(
@@ -1340,7 +1355,7 @@ def results() -> rx.Component:
                                 ),
                             ),
                             rx.cond(
-                                State.step_by_step_description | (State.llm_status == "pending"),
+                                State.show_steps_panel,
                                 rx.grid(
                                     steps_panel(),
                                     security_panel(),
