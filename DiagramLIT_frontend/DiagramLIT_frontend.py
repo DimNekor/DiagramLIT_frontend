@@ -304,7 +304,6 @@ class State(rx.State):
         self._reset_results()
         self.is_uploading = True
         self.uploaded_filename = files[0].filename
-        yield
         
         file_content = await files[0].read()
         
@@ -317,7 +316,7 @@ class State(rx.State):
             f.write(file_content)
             
         self.image_path = safe_filename
-        yield State.run_analysis
+        return State.run_analysis
 
     async def _infer_with_heartbeat(self, infer, image_bytes: bytes) -> Dict[str, Any]:
         task = asyncio.create_task(infer(image_bytes))
