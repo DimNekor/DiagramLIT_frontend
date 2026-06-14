@@ -30,10 +30,10 @@ ORANGEPI_POLL_TIMEOUT = float(os.getenv("ORANGEPI_POLL_TIMEOUT", 30.0))
 # Интервал опроса статуса LLM
 ORANGEPI_POLL_INTERVAL = float(os.getenv("ORANGEPI_POLL_INTERVAL", 2.0))
 
-BPMN_ANALYSIS_PROMPT = """
+BPMN_ANALYSIS_PROMPT = '''
 Ты — эксперт по анализу BPMN-диаграмм и информационной безопасности.
 
-Проанализируй предоставленное изображение BPMN-диаграммы и верни ответ СТРОГО в виде JSON-объекта без markdown-разметки (без ```json), без пояснений, только сырой JSON.
+Проанализируй предоставленное изображение BPMN-диаграммы и верни ответ СТРОГО в виде JSON-объекта без markdown-разметки, без пояснений, только сырой JSON.
 
 Для распознавания элементов используй СТРОГО следующий список классов (как в модели детекции):
 - arrow_end (конец стрелки/поток управления)
@@ -90,13 +90,17 @@ BPMN_ANALYSIS_PROMPT = """
 - Если явных проблем нет — верни пустой список [].
 
 Верни ТОЛЬКО JSON-объект.
-"""
+'''
 
 def _parse_model_json(text: str) -> Dict[str, Any]:
     text = text.strip()
-    text = re.sub(r"^json)?\s*", "", text)
-    text = re.sub(r"\s*```$", "", text.strip())
+    
+    # ИСПОЛЬЗУЕМ HEX-КОД СИМВОЛА \x60 ВМЕСТО САМИХ КАВЫЧЕК
+    # Это предотвращает поломку UI-редактора
+    text = re.sub(r"^\x60{3}(?:json)?\s*", "", text)
+    text = re.sub(r"\s*\x60{3}$", "", text.strip())
     text = text.strip()
+    
     try:
         return json.loads(text)
     except json.JSONDecodeError:
@@ -104,6 +108,7 @@ def _parse_model_json(text: str) -> Dict[str, Any]:
         if match:
             return json.loads(match.group())
         raise ValueError(f"Не удалось разобрать JSON из ответа модели: {text[:300]}")
+
 
 MODEL_BACKENDS: Dict[str, str] = {
     "gemini": "Gemini 3.1 Pro · облако",
@@ -204,7 +209,7 @@ class State(rx.State):
 
     selected_model: str = "gemini"
     
-    # ИСПРАВЛЕНИЕ: Вместо Base64 храним только путь к файлу
+    # Сохраняем только путь к файлу
     image_path: str = ""
     
     uploaded_filename: str = ""
@@ -268,7 +273,6 @@ class State(rx.State):
                 pass
         self.bounding_boxes = boxes
 
-    # ── ИСПРАВЛЕНИЕ УТЕЧКИ WEBSOCKET: Сохраняем в файл, а не в State ──
     async def handle_upload(self, files: List[rx.UploadFile]):
         if not files:
             self.is_uploading = False
@@ -320,7 +324,7 @@ class State(rx.State):
                     return
                 model_key = self.selected_model
                 
-            # ИСПРАВЛЕНИЕ: Читаем байты из локального файла
+            # Читаем байты из локального файла
             local_path = os.path.join("assets", self.image_path.lstrip("/"))
             try:
                 with open(local_path, "rb") as f:
@@ -489,7 +493,7 @@ def navbar():
             rx.link("Главная", href="/", color="white", font_weight="500"),
             rx.link(
                 "GitHub",
-                href="[https://github.com](https://github.com)",
+                href="https://github.com",
                 color="white",
                 font_weight="500",
                 is_external=True,
@@ -741,7 +745,6 @@ def diagram_viewer() -> rx.Component:
             rx.text("Красные рамки — обнаруженные элементы диаграммы", font_size="0.85em", color="#718096"),
             rx.divider(),
             rx.box(
-                # ИСПРАВЛЕНИЕ: Используем путь к файлу из assets
                 rx.image(src=State.image_path, width="100%", height="auto", display="block", border_radius="8px"),
                 rx.foreach(State.bounding_boxes, bbox_overlay),
                 position="relative", width="100%", max_width="820px", margin="0 auto",
@@ -882,7 +885,6 @@ def results() -> rx.Component:
                                 ),
                                 spacing="3", width="100%", padding="1.5em", border_radius="12px", bg="white",
                             ),
-                            # ИСПРАВЛЕНИЕ: Проверяем наличие image_path
                             rx.cond(State.image_path, diagram_viewer()),
                             rx.cond(
                                 State.detected_elements,
